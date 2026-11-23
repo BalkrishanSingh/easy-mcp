@@ -4,7 +4,9 @@
 
 Connect a local project folder to Claude Web, ChatGPT or Gemini over the Model Context Protocol. One command and you're in — one web dashboard, lightweight and fast.
 
-▶️ **Watch the demo:** [Free Claude & ChatGPT vs Gemini Pro — who controls my PC?](https://www.youtube.com/watch?v=P-xTnxFNU80)
+▶️ **Watch the demos:**
+- [Free Claude & ChatGPT vs Gemini Pro — who controls my PC?](https://www.youtube.com/watch?v=P-xTnxFNU80)
+- [I Built a Mini Amazon with Only Gemini Web (Full Stack)](https://youtu.be/9vPKYf_BFlo)
 
 - **Official custom MCP only.** Easy MCP uses the built-in custom MCP connector of your AI client — the standard, first-party way to connect tools. No wrapper, no proxy, no browser automation, no cookies, no login scraping. Nothing here violates any terms of service.
 - **One link, no login.** Paste the link into your AI account and you are done. Easy MCP never asks for your credentials and cannot take anything from your account.
