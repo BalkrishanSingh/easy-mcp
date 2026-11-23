@@ -646,7 +646,7 @@ async function handleRpc(msg) {
       return reply({
         protocolVersion: params?.protocolVersion || '2025-03-26',
         capabilities: { tools: {} },
-        serverInfo: { name: 'Easy MCP', version: '2.3.0' }
+        serverInfo: { name: 'Easy MCP', version: '2.3.1' }
       });
     case 'notifications/initialized':
       return null;
@@ -806,7 +806,7 @@ function dashboardData() {
   const q = TOKEN ? `?token=${TOKEN}` : '';
   return {
     status: 'online',
-    version: '2.3.0',
+    version: '2.3.1',
     project: projectRoot,
     recentProjects,
     readOnly: READ_ONLY,
