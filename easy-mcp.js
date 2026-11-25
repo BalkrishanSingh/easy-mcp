@@ -2,13 +2,12 @@
 /*
  * Easy MCP — launcher
  *
- * Starts the MCP server, opens a Cloudflare quick tunnel, and opens the
- * web dashboard in your browser. No terminal UI — everything happens on
- * the web page.
+ * Starts the MCP server, opens a tunnel (Cloudflare or Tailscale Funnel),
+ * and opens the local web dashboard in your browser.
  *
  * Usage:
- *   node easy-mcp.js [project-folder] [--port 9494] [--funnel] [--no-tunnel] [--no-open]
- *                    [--read-only] [--enable-shell] [--token <token>]
+ *   node easy-mcp.js [project-folder] [--port 9494] [--funnel] [--cloudflare] [--no-tunnel] [--no-open]
+ *                    [--read-only] [--enable-shell] [--token <token>] [--rotate-token]
  *                    [--dangerously-skip-jail]  (no folder jail: whole machine)
  */
 'use strict';
@@ -18,42 +17,9 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const https = require('https');
 
 let VERSION = '0.0.0';
 try { VERSION = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version || VERSION; } catch {}
-
-// npx caches the downloaded tarball, so an installed copy never updates
-// itself. Check GitHub for a newer release (or a newer build of the same
-// version) and tell the user how to refresh. Silent on any failure.
-function checkForUpdate() {
-  const configFile = path.join(os.homedir(), '.easy-mcp', 'config.json');
-  let cfg = {};
-  try { cfg = JSON.parse(fs.readFileSync(configFile, 'utf8')); } catch {}
-  const req = https.get('https://api.github.com/repos/mrkaylabs/easy-mcp/releases/latest', { headers: { 'User-Agent': 'easy-mcp' }, timeout: 4000 }, (res) => {
-    let body = '';
-    res.on('data', d => { body += d; });
-    res.on('end', () => {
-      try {
-        const rel = JSON.parse(body);
-        const latest = String(rel.tag_name || '').replace(/^v/, '');
-        const relId = rel.id;
-        const seenId = cfg.lastSeenReleaseId;
-        if (latest && (latest !== VERSION || (seenId && relId && relId !== seenId))) {
-          console.log(`\nUpdate available: v${latest} (you have v${VERSION}).`);
-          console.log('To update, delete the npx cache folder, then run the same command again:');
-          console.log(process.platform === 'win32' ? '  %LocalAppData%\\npm-cache\\_npx' : '  ~/.npm/_npx');
-        }
-        if (relId && relId !== seenId) {
-          cfg.lastSeenReleaseId = relId;
-          try { fs.mkdirSync(path.dirname(configFile), { recursive: true }); fs.writeFileSync(configFile, JSON.stringify(cfg, null, 2)); } catch {}
-        }
-      } catch {}
-    });
-  });
-  req.on('error', () => {});
-  req.on('timeout', () => req.destroy());
-}
 
 const args = process.argv.slice(2);
 function argValue(name, fallback) {
@@ -73,7 +39,7 @@ function loadToken() {
   }
   const fresh = crypto.randomBytes(24).toString('hex');
   try {
-    fs.mkdirSync(path.dirname(tokenFile), { recursive: true });
+    fs.mkdirSync(path.dirname(tokenFile), { recursive: true, mode: 0o700 });
     fs.writeFileSync(tokenFile, fresh + '\n', { mode: 0o600 });
   } catch {}
   return fresh;
@@ -114,18 +80,31 @@ function killOldInstances() {
       ].join('; ');
       spawnSync('powershell.exe', ['-NoProfile', '-Command', ps], { windowsHide: true });
     } else {
-      spawnSync('pkill', ['-f', '^node .*easy-mcp.*server\\.js']);
+      const serverPath = path.join(__dirname, 'server.js');
+      const escapedServer = serverPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      spawnSync('pkill', ['-f', escapedServer]);
+      if (escapedServer !== 'easy-mcp.*server\\.js') spawnSync('pkill', ['-f', 'easy-mcp.*server\\.js']);
       spawnSync('pkill', ['-f', 'cloudflared.*\\.easy-mcp']);
-      // Kill a node process still listening on our port (relative-path launches).
-      const out = spawnSync('ss', ['-tlnp'], { encoding: 'utf8' }).stdout || '';
-      for (const line of out.split('\n')) {
-        if (!line.includes(`:${PORT} `)) continue;
-        const m = line.match(/pid=(\d+)/);
-        if (!m) continue;
-        try {
-          const cmd = fs.readFileSync(`/proc/${m[1]}/cmdline`, 'utf8');
-          if (cmd.includes('node')) process.kill(Number(m[1]), 'SIGKILL');
-        } catch {}
+      // Also check if an easy-mcp node process is still holding our target port (macOS + Linux).
+      const pids = new Set();
+      const lsofOut = spawnSync('lsof', [`-tiTCP:${PORT}`, '-sTCP:LISTEN'], { encoding: 'utf8' }).stdout || '';
+      for (const line of lsofOut.split('\n')) {
+        const pid = Number(line.trim());
+        if (pid && pid !== process.pid) pids.add(pid);
+      }
+      if (!pids.size) {
+        const ssOut = spawnSync('ss', ['-tlnp'], { encoding: 'utf8' }).stdout || '';
+        for (const line of ssOut.split('\n')) {
+          if (!line.includes(`:${PORT} `)) continue;
+          const m = line.match(/pid=(\d+)/);
+          if (m && Number(m[1]) !== process.pid) pids.add(Number(m[1]));
+        }
+      }
+      for (const pid of pids) {
+        const comm = (spawnSync('ps', ['-p', String(pid), '-o', 'args='], { encoding: 'utf8' }).stdout || '').trim();
+        if (comm.includes('node') && (comm.includes(serverPath) || comm.includes('easy-mcp'))) {
+          try { process.kill(pid, 'SIGKILL'); } catch {}
+        }
       }
     }
   } catch {}
@@ -146,16 +125,15 @@ async function main() {
   if (args.includes('--disable-shell')) serverArgs.push('--disable-shell');
   if (SKIP_JAIL) serverArgs.push('--dangerously-skip-jail');
   const server = spawn(process.execPath, serverArgs, {
-    env: { ...process.env, EASY_MCP_PORT: String(PORT), EASY_MCP_TOKEN: TOKEN, EASY_MCP_PROJECT: projectDir, ...(TUNNEL_MODE ? { EASY_MCP_TUNNEL: TUNNEL_MODE } : {}) },
+    env: { ...process.env, EASY_MCP_PORT: String(PORT), EASY_MCP_TOKEN: TOKEN, EASY_MCP_PROJECT: projectDir, EASY_MCP_VERSION: VERSION, ...(TUNNEL_MODE ? { EASY_MCP_TUNNEL: TUNNEL_MODE } : {}) },
     stdio: ['ignore', 'pipe', 'pipe']
   });
   server.stdout.on('data', d => process.stdout.write(d));
   server.stderr.on('data', d => process.stderr.write(d));
 
-  const localDashboard = `http://127.0.0.1:${PORT}/?token=${TOKEN}`;
+  const localDashboard = `http://127.0.0.1:${PORT}/`;
   console.log(`Easy MCP v${VERSION}`);
   console.log(`Project:   ${projectDir}`);
-  checkForUpdate();
   if (SKIP_JAIL) console.log('WARNING: --dangerously-skip-jail is ON. The AI can read, write and run commands anywhere on this machine.');
   console.log(`Dashboard: ${localDashboard}`);
 

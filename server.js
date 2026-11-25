@@ -40,6 +40,10 @@ function argValue(name, fallback) {
   return i >= 0 && args[i + 1] ? args[i + 1] : fallback;
 }
 const PORT = Number(process.env.EASY_MCP_PORT || argValue('--port', '9494'));
+let VERSION = process.env.EASY_MCP_VERSION || '0.0.0';
+if (VERSION === '0.0.0') {
+  try { VERSION = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version || VERSION; } catch {}
+}
 let TOKEN = process.env.EASY_MCP_TOKEN || argValue('--token', '');
 // Fail closed: never run unauthenticated. If no token was passed in (direct
 // `node server.js` run), load or create the persistent one the launcher uses.
@@ -133,7 +137,11 @@ function ensureCloudflared() {
 }
 
 function stopTunnel() {
-  if (tunnelProc) { try { tunnelProc.kill(); } catch {} tunnelProc = null; }
+  if (tunnelProc) {
+    tunnelProc._stopped = true;
+    try { tunnelProc.kill(); } catch {}
+    tunnelProc = null;
+  }
   // Note: Funnel is left ON in tailscaled when switching away — turning it off
   // requires the Tailscale owner's session, and it proxies the same port anyway.
   publicUrl = '';
@@ -163,7 +171,8 @@ async function startTunnel(mode) {
   // cloudflare
   tunnelMode = 'cloudflare';
   const bin = await ensureCloudflared();
-  tunnelProc = spawn(bin, ['tunnel', '--url', `http://127.0.0.1:${PORT}`], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const proc = spawn(bin, ['tunnel', '--url', `http://127.0.0.1:${PORT}`], { stdio: ['ignore', 'pipe', 'pipe'] });
+  tunnelProc = proc;
   const onData = (d) => {
     const m = String(d).match(/https:\/\/(?!api\.)[a-z0-9-]+\.trycloudflare\.com/);
     if (m && !publicUrl) {
@@ -171,9 +180,14 @@ async function startTunnel(mode) {
       console.log(`MCP link:  ${publicUrl}/mcp/${TOKEN}`);
     }
   };
-  tunnelProc.stdout.on('data', onData);
-  tunnelProc.stderr.on('data', onData);
-  tunnelProc.on('exit', () => { tunnelProc = null; if (!publicUrl) tunnelError = 'Cloudflare tunnel failed to start (no internet route?)'; });
+  proc.stdout.on('data', onData);
+  proc.stderr.on('data', onData);
+  proc.on('exit', () => {
+    if (tunnelProc === proc) tunnelProc = null;
+    if (!proc._stopped && tunnelMode === 'cloudflare' && !publicUrl) {
+      tunnelError = 'Cloudflare tunnel failed to start (no internet route?)';
+    }
+  });
 }
 
 async function setTunnel(mode) {
@@ -226,14 +240,15 @@ function realpathOrAncestor(abs) {
   }
 }
 function resolveInProject(p) {
-  const abs = path.resolve(projectRoot, String(p || '.'));
+  const base = path.resolve(projectRoot);
+  const abs = path.resolve(base, String(p || '.'));
   if (SKIP_JAIL) return abs; // --dangerously-skip-jail: any path on the machine
-  const root = realpathOrAncestor(projectRoot);
-  const rel = path.relative(root, abs);
-  if (rel.startsWith('..') || path.isAbsolute(rel)) {
+  const lexRel = path.relative(base, abs);
+  if (lexRel.startsWith('..') || path.isAbsolute(lexRel)) {
     throw new Error(`Path escapes project folder: ${p}`);
   }
-  // Symlink escape: the real location must also stay inside the project.
+  // Symlink escape: the real location must also stay inside the real project root.
+  const root = realpathOrAncestor(base);
   const real = realpathOrAncestor(abs);
   const realRel = path.relative(root, real);
   if (realRel.startsWith('..') || path.isAbsolute(realRel)) {
@@ -242,11 +257,13 @@ function resolveInProject(p) {
   return abs;
 }
 // When the shell is disabled, writes into .git internals could smuggle command
-// execution back in through git itself (config keys, hooks). Block those.
+// execution back in through git itself (config keys, hooks). Block those
+// case-insensitively so macOS/Windows case-insensitive filesystems can't bypass.
 function assertNotGitInternal(abs) {
   if (!DISABLE_SHELL) return;
   const rel = path.relative(realpathOrAncestor(projectRoot), realpathOrAncestor(abs)).split(path.sep).join('/');
-  if (rel === '.gitmodules' || rel === '.git/config' || rel.startsWith('.git/hooks/')) {
+  const parts = rel.toLowerCase().split('/');
+  if (parts.includes('.git') || parts.includes('.gitmodules')) {
     throw new Error('Writing git internals is blocked while the shell is disabled');
   }
 }
@@ -270,6 +287,7 @@ function killJob(job) {
   if (process.platform === 'win32') {
     try { execFile('taskkill', ['/PID', String(job.pid), '/T', '/F'], { windowsHide: true }, () => {}); return; } catch {}
   }
+  try { process.kill(-job.pid, 'SIGTERM'); return; } catch {}
   try { process.kill(job.pid); } catch {}
 }
 let jobSeq = 0;
@@ -283,7 +301,7 @@ function shellCommand(command) {
 function startJob(command) {
   const id = `job-${++jobSeq}`;
   const { file, args: sargs } = shellCommand(command);
-  const child = spawn(file, sargs, { cwd: projectRoot, windowsHide: true });
+  const child = spawn(file, sargs, { cwd: projectRoot, windowsHide: true, detached: process.platform !== 'win32' });
   const job = { id, command, pid: child.pid, startedAt: new Date().toISOString(), status: 'running', exitCode: null, log: '' };
   const push = d => { job.log += d.toString(); if (job.log.length > 200000) job.log = job.log.slice(-200000); };
   child.stdout.on('data', push);
@@ -352,44 +370,49 @@ function runGit(gitArgs, timeoutMs = 30000) {
 }
 
 // fetch_url runs on this machine, so it must never reach private addresses
-// (loopback, LAN, link-local) — the model only ever needs public docs.
+// (loopback, LAN, link-local, CGNAT/Tailscale) — the model only ever needs public docs.
 function isPrivateHost(hostname) {
   const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
-  if (h === 'localhost' || h.endsWith('.localhost') || h === '::1' || h === '::' || h === '0.0.0.0') return true;
+  if (!h || h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h === '::1' || h === '::' || h === '0.0.0.0') return true;
   if (h.includes(':')) {
     if (h.startsWith('::ffff:')) return isPrivateHost(h.slice(7));
-    return h.startsWith('fe8') || h.startsWith('fe9') || h.startsWith('fea') || h.startsWith('feb') || h.startsWith('fc') || h.startsWith('fd');
+    return h.startsWith('fe8') || h.startsWith('fe9') || h.startsWith('fea') || h.startsWith('feb') || h.startsWith('fc') || h.startsWith('fd') || h.startsWith('ff');
   }
   const m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
   if (!m) return false;
   const [a, b] = [Number(m[1]), Number(m[2])];
-  return a === 127 || a === 10 || a === 0 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254);
+  return a === 127 || a === 10 || a === 0 || (a === 100 && b >= 64 && b <= 127) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254);
 }
 
 function fetchUrl(url, hops = 0) {
   return new Promise((resolve, reject) => {
     if (!/^https:\/\//.test(url)) return reject(new Error('Only https:// URLs are allowed'));
-    let host;
-    try { host = new URL(url).hostname; } catch { return reject(new Error('Invalid URL')); }
+    let parsed;
+    try { parsed = new URL(url); } catch { return reject(new Error('Invalid URL')); }
+    const host = parsed.hostname;
     if (isPrivateHost(host)) return reject(new Error('Blocked: private/loopback addresses are not allowed'));
     if (hops > 5) return reject(new Error('Too many redirects (limit 5)'));
-    // A public name can still resolve to a private address — check DNS too.
+    // Resolve once and pin the validated IP to prevent DNS-rebinding TOCTOU.
     dns.promises.lookup(host, { all: true }).then(addrs => {
+      if (!addrs.length) return reject(new Error('DNS lookup returned no addresses'));
       if (addrs.some(a => isPrivateHost(a.address))) return reject(new Error('Blocked: host resolves to a private/loopback address'));
-      doFetch();
-    }).catch(() => doFetch());
-    function doFetch() {
-    https.get(url, { headers: { 'User-Agent': 'easy-mcp' }, timeout: 20000 }, (res) => {
-      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
-        res.resume();
-        return resolve(fetchUrl(new URL(res.headers.location, url).toString(), hops + 1));
-      }
-      let body = '';
-      res.setEncoding('utf8');
-      res.on('data', d => { body += d; if (body.length > 300000) res.destroy(); });
-      res.on('end', () => resolve(body.slice(0, 300000)));
-    }).on('error', reject);
-    }
+      const validated = addrs.map(a => ({ address: a.address, family: a.family }));
+      const pinnedLookup = (_h, opts, cb) => {
+        if (typeof opts === 'function') return opts(null, validated[0].address, validated[0].family);
+        if (opts && opts.all) return cb(null, validated);
+        return cb(null, validated[0].address, validated[0].family);
+      };
+      https.get(url, { headers: { 'User-Agent': 'easy-mcp' }, timeout: 20000, lookup: pinnedLookup }, (res) => {
+        if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+          res.resume();
+          return resolve(fetchUrl(new URL(res.headers.location, url).toString(), hops + 1));
+        }
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', d => { body += d; if (body.length > 300000) res.destroy(); });
+        res.on('end', () => resolve(body.slice(0, 300000)));
+      }).on('error', reject);
+    }).catch(err => reject(new Error(`DNS lookup failed: ${err.message}`)));
   });
 }
 
@@ -646,7 +669,7 @@ async function handleRpc(msg) {
       return reply({
         protocolVersion: params?.protocolVersion || '2025-03-26',
         capabilities: { tools: {} },
-        serverInfo: { name: 'Easy MCP', version: '2.3.1' }
+        serverInfo: { name: 'Easy MCP', version: VERSION }
       });
     case 'notifications/initialized':
       return null;
@@ -748,11 +771,32 @@ function sendJson(res, code, obj) {
 }
 function readBody(req, maxBytes = 10_000_000) {
   return new Promise((resolve, reject) => {
-    let body = '';
-    req.on('data', d => { body += d; if (body.length > maxBytes) req.destroy(); });
-    req.on('end', () => resolve(body));
-    req.on('error', reject);
+    const chunks = [];
+    let total = 0;
+    let done = false;
+    req.on('data', d => {
+      if (done) return;
+      total += d.length;
+      if (total > maxBytes) {
+        done = true;
+        const err = new Error('Payload too large');
+        err.statusCode = 413;
+        req.destroy();
+        return reject(err);
+      }
+      chunks.push(d);
+    });
+    req.on('end', () => { if (!done) { done = true; resolve(Buffer.concat(chunks).toString('utf8')); } });
+    req.on('error', err => { if (!done) { done = true; reject(err); } });
   });
+}
+function parseJsonBody(raw) {
+  try { return JSON.parse(raw || '{}'); }
+  catch {
+    const err = new Error('Invalid JSON');
+    err.statusCode = 400;
+    throw err;
+  }
 }
 const PUBLIC_PATHS = new Set([
   '/.well-known/oauth-authorization-server',
@@ -802,11 +846,18 @@ function hostAllowed(req) {
   return false;
 }
 
+function pruneMcpSessions() {
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  for (const [id, info] of mcpSessions) {
+    if ((info.lastSeen || info.createdAt || 0) < cutoff) mcpSessions.delete(id);
+  }
+}
+
 function dashboardData() {
-  const q = TOKEN ? `?token=${TOKEN}` : '';
+  pruneMcpSessions();
   return {
     status: 'online',
-    version: '2.3.1',
+    version: VERSION,
     project: projectRoot,
     recentProjects,
     readOnly: READ_ONLY,
@@ -814,7 +865,10 @@ function dashboardData() {
     skipJail: SKIP_JAIL,
     toolsCount: TOOLS.length,
     toolNames: TOOLS.map(t => t.name),
-    sseSessions: sseSessions.size,
+    activeSessions: sseSessions.size + mcpSessions.size,
+    oauthClientsCount: oauthClients.size,
+    oauthTokensCount: [...oauthTokens.values()].filter(t => t.type === 'refresh' || !t.exp || t.exp > Date.now()).length,
+    token: TOKEN,
     uptimeSec: Math.floor((Date.now() - startedAt) / 1000),
     startedAt: new Date(startedAt).toISOString(),
     totalCalls,
@@ -835,9 +889,6 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Easy MCP</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Cinzel+Decorative:wght@700;900&family=Cinzel:wght@600;700;900&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
   :root {
     color-scheme: dark light;
@@ -850,14 +901,15 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     --muted: #96897b;
     --gold: #f59e0b;
     --flame: #ea580c;
-    --flame-dark: #9a2c04;
     --ok: #22c55e;
     --err: #ef4444;
-    --accent-glow: rgba(234, 88, 12, 0.18);
-    --gold-glow: rgba(245, 158, 11, 0.15);
+    --accent-glow: rgba(234, 88, 12, 0.14);
+    --gold-glow: rgba(245, 158, 11, 0.12);
     --input-bg: #100f0d;
-    --radius: 14px;
+    --radius: 12px;
     --radius-sm: 8px;
+    --sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
   }
   @media (prefers-color-scheme: light) {
     :root {
@@ -867,7 +919,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       --border: #e8e0d5;
       --border-hover: #cbbfb0;
       --text: #1d1916;
-      --muted: #847566;
+      --muted: #706356;
       --input-bg: #f5f0e8;
       --accent-glow: rgba(234, 88, 12, 0.08);
       --gold-glow: rgba(245, 158, 11, 0.08);
@@ -876,182 +928,108 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
-    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+    font-family: var(--sans);
     background: var(--bg);
     color: var(--text);
     -webkit-font-smoothing: antialiased;
     min-height: 100vh;
-    padding: 36px 20px 60px;
-    background-image: 
-      radial-gradient(ellipse 60% 40% at 50% -10%, rgba(234, 88, 12, 0.12), transparent 70%),
-      radial-gradient(circle at 10% 20%, rgba(245, 158, 11, 0.04), transparent 40%);
+    padding: 28px 20px 56px;
   }
 
-  .container {
-    max-width: 960px;
-    margin: 0 auto;
-  }
+  .container { max-width: 960px; margin: 0 auto; }
 
-  /* Hero Section */
   .hero {
-    text-align: center;
-    padding: 10px 0 32px;
-    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+    padding-bottom: 20px;
+    margin-bottom: 18px;
+    border-bottom: 1px solid var(--border);
+  }
+  .hero-title {
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    color: var(--text);
   }
   .hero-badge {
     display: inline-flex;
     align-items: center;
     gap: 7px;
-    padding: 5px 14px;
+    padding: 5px 12px;
     background: var(--card);
     border: 1px solid var(--border);
     border-radius: 999px;
     font-size: 11px;
     font-weight: 600;
-    letter-spacing: 0.08em;
+    letter-spacing: 0.06em;
     text-transform: uppercase;
     color: var(--gold);
-    box-shadow: 0 2px 10px var(--gold-glow);
-    margin-bottom: 14px;
   }
   .hero-badge .status-dot {
     width: 6px;
     height: 6px;
     border-radius: 50%;
     background: var(--ok);
-    box-shadow: 0 0 8px var(--ok);
-    animation: pulse 2.2s infinite ease-in-out;
-  }
-  @keyframes pulse {
-    0%, 100% { opacity: 1; transform: scale(1); }
-    50% { opacity: 0.4; transform: scale(0.85); }
+    box-shadow: 0 0 6px var(--ok);
   }
 
-  /* Mortal Kombat Inspired Title */
-  .logo-mk {
-    font-family: 'Cinzel Decorative', 'Cinzel', serif;
-    font-size: 42px;
-    font-weight: 900;
-    letter-spacing: 0.18em;
-    text-transform: uppercase;
-    background: linear-gradient(180deg, #FFF7ED 0%, #FDE68A 25%, #F59E0B 55%, #D9480F 82%, #7C1D05 100%);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    filter: drop-shadow(0 4px 18px rgba(217, 72, 15, 0.35));
-    line-height: 1.1;
-    margin-bottom: 10px;
-    position: relative;
-    display: inline-block;
-  }
-  .logo-mk::after {
-    content: '';
-    position: absolute;
-    bottom: -6px;
-    left: 20%;
-    right: 20%;
-    height: 1.5px;
-    background: linear-gradient(90deg, transparent, var(--flame), var(--gold), transparent);
-  }
-
-  .hero-subtitle {
-    font-size: 14.5px;
-    font-weight: 500;
-    color: var(--muted);
-    letter-spacing: 0.02em;
-    margin-top: 14px;
-  }
-  .hero-subtitle strong {
-    color: var(--text);
-    font-weight: 600;
-  }
-  .hero-subtitle .glow-text {
-    background: linear-gradient(135deg, #F59E0B, #EA580C);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    font-weight: 700;
-  }
-
-  /* Grid Layout (Desktop 2-column) */
-  .grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 16px;
-  }
-  .span-full {
-    grid-column: 1 / -1;
-  }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .span-full { grid-column: 1 / -1; }
   @media (max-width: 720px) {
     .grid { grid-template-columns: 1fr; }
     .span-full { grid-column: auto; }
-    .logo-mk { font-size: 32px; letter-spacing: 0.12em; }
   }
 
-  /* Cards */
   .card {
     background: var(--card);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    padding: 22px;
-    transition: all 0.2s ease;
-    position: relative;
-    box-shadow: 0 4px 20px rgba(0,0,0,0.15);
-  }
-  .card:hover {
-    border-color: var(--border-hover);
-    box-shadow: 0 6px 24px var(--accent-glow);
+    padding: 20px;
   }
   .card-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 16px;
+    gap: 8px;
+    margin-bottom: 14px;
   }
   .card-title {
     font-size: 11px;
     font-weight: 700;
     text-transform: uppercase;
-    letter-spacing: 0.12em;
+    letter-spacing: 0.1em;
     color: var(--muted);
     display: flex;
     align-items: center;
     gap: 8px;
   }
-  .card-title svg {
-    color: var(--gold);
-    width: 14px;
-    height: 14px;
-  }
+  .card-title svg { color: var(--gold); width: 14px; height: 14px; }
 
-  /* Input & Button Groups */
-  .input-row {
-    display: flex;
-    gap: 8px;
-  }
+  .input-row { display: flex; gap: 8px; }
   .input-text {
     flex: 1;
     min-width: 0;
-    padding: 11px 14px;
+    padding: 10px 12px;
     background: var(--input-bg);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     color: var(--text);
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--mono);
     font-size: 12px;
     outline: none;
-    transition: border-color 0.15s, box-shadow 0.15s;
   }
-  .input-text:focus {
-    border-color: var(--gold);
-    box-shadow: 0 0 0 2px var(--gold-glow);
-  }
+  .input-text:focus { border-color: var(--gold); box-shadow: 0 0 0 2px var(--gold-glow); }
 
   .btn {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    gap: 7px;
-    padding: 10px 18px;
-    font-family: 'Plus Jakarta Sans', sans-serif;
+    gap: 6px;
+    padding: 9px 14px;
+    font-family: var(--sans);
     font-size: 12.5px;
     font-weight: 600;
     border-radius: var(--radius-sm);
@@ -1059,74 +1037,89 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     border: 1px solid var(--border);
     background: var(--card-elevated);
     color: var(--text);
-    transition: all 0.15s ease;
     white-space: nowrap;
     text-decoration: none;
   }
-  .btn:hover {
-    background: var(--border-hover);
-    transform: translateY(-1px);
-  }
+  .btn:hover { background: var(--border-hover); }
   .btn-primary {
     background: linear-gradient(135deg, #f59e0b, #d9480f);
     border-color: #d9480f;
     color: #fff;
-    box-shadow: 0 2px 10px rgba(217, 72, 15, 0.3);
   }
-  .btn-primary:hover {
-    background: linear-gradient(135deg, #fbbf24, #ea580c);
-    box-shadow: 0 4px 14px rgba(217, 72, 15, 0.45);
-  }
+  .btn-primary:hover { filter: brightness(1.08); }
 
-  /* Quick Connect Connectors Strip */
-  .connectors-strip {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    gap: 10px;
-    margin-top: 14px;
-  }
-  .connector-card {
+  .tunnel-bar {
     display: flex;
     align-items: center;
-    gap: 12px;
-    padding: 11px 15px;
-    border-radius: var(--radius-sm);
-    background: var(--card-elevated);
+    justify-content: space-between;
+    gap: 10px;
+    margin-top: 12px;
+    flex-wrap: wrap;
+  }
+  .tunnel-seg {
+    display: inline-flex;
     border: 1px solid var(--border);
-    color: var(--text);
-    text-decoration: none;
-    transition: all 0.15s ease;
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    background: var(--input-bg);
   }
-  .connector-card:hover {
-    transform: translateY(-2px);
-    border-color: var(--gold);
-    box-shadow: 0 4px 14px rgba(0,0,0,0.25);
-  }
-  .connector-card svg {
-    width: 22px;
-    height: 22px;
-    flex-shrink: 0;
-  }
-  .connector-info {
-    display: flex;
-    flex-direction: column;
-    min-width: 0;
-  }
-  .connector-info .c-name {
-    font-size: 12.5px;
-    font-weight: 600;
-    color: var(--text);
-    line-height: 1.2;
-  }
-  .connector-info .c-step {
-    font-size: 10px;
+  .tun-btn {
+    padding: 7px 13px;
+    font-family: var(--sans);
+    font-size: 12px;
+    font-weight: 500;
+    border: none;
+    cursor: pointer;
+    background: transparent;
     color: var(--muted);
-    margin-top: 3px;
-    letter-spacing: 0.02em;
-    font-family: 'JetBrains Mono', monospace;
+  }
+  .tun-btn:hover { color: var(--text); }
+  .tun-btn.active {
+    background: linear-gradient(135deg, #f59e0b, #d9480f);
+    color: #fff;
+    font-weight: 600;
   }
 
-  /* Recent Projects */
+  .quick-links {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    font-size: 11.5px;
+    color: var(--muted);
+  }
+  .quick-link {
+    padding: 4px 10px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--text);
+    text-decoration: none;
+    background: var(--card-elevated);
+    font-size: 11.5px;
+  }
+  .quick-link:hover { border-color: var(--gold); }
+
+  .token-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+    flex-wrap: wrap;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .token-code {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    background: var(--input-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 8px;
+    color: var(--text);
+  }
+
   .recents-label {
     font-size: 10.5px;
     font-weight: 700;
@@ -1146,38 +1139,28 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     color: var(--text);
-    font-family: 'JetBrains Mono', monospace;
+    font-family: var(--mono);
     font-size: 11.5px;
     cursor: pointer;
-    transition: all 0.15s;
+    word-break: break-all;
   }
-  .recent-item:hover {
-    background: var(--card-elevated);
-    border-color: var(--muted);
-  }
-  .recent-item.active {
-    border-color: var(--gold);
-    background: rgba(245, 158, 11, 0.08);
-  }
+  .recent-item:hover { background: var(--card-elevated); border-color: var(--muted); }
+  .recent-item.active { border-color: var(--gold); background: rgba(245, 158, 11, 0.08); }
   .recent-item .tag {
     margin-left: auto;
-    font-family: 'Plus Jakarta Sans', sans-serif;
+    padding: 2px 7px;
+    font-family: var(--sans);
     font-size: 9px;
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.08em;
     color: #fff;
-    padding: 2px 7px;
     background: linear-gradient(135deg, #f59e0b, #ea580c);
     border-radius: 4px;
+    flex-shrink: 0;
   }
 
-  /* Toggle Settings */
-  .toggle-group {
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-  }
+  .toggle-group { display: flex; flex-direction: column; gap: 12px; }
   .toggle-item {
     display: flex;
     align-items: center;
@@ -1185,257 +1168,133 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     padding: 10px 0;
     border-bottom: 1px solid var(--border);
   }
-  .toggle-item:last-child {
-    border-bottom: none;
-    padding-bottom: 0;
-  }
-  .toggle-item:first-child {
-    padding-top: 0;
-  }
-  .toggle-meta .t-title {
-    font-size: 13px;
-    font-weight: 600;
-    color: var(--text);
-  }
-  .toggle-meta .t-desc {
-    font-size: 11.5px;
-    color: var(--muted);
-    margin-top: 2px;
-  }
+  .toggle-item:last-child { border-bottom: none; padding-bottom: 0; }
+  .toggle-item:first-child { padding-top: 0; }
+  .toggle-meta .t-title { font-size: 13px; font-weight: 600; color: var(--text); }
+  .toggle-meta .t-desc { font-size: 11.5px; color: var(--muted); margin-top: 2px; line-height: 1.4; }
 
-  /* Hover tooltip on toggle rows */
-  .toggle-item { position: relative; }
-  .toggle-item[data-tip]:hover::after {
-    content: attr(data-tip);
-    position: absolute;
-    left: 0;
-    bottom: calc(100% + 6px);
-    max-width: 320px;
-    background: var(--card, #171512);
-    color: var(--text);
-    border: 1px solid rgba(245,158,11,.45);
-    border-radius: 10px;
-    padding: 8px 10px;
-    font-size: 11.5px;
-    line-height: 1.45;
-    box-shadow: 0 10px 30px rgba(0,0,0,.45);
-    z-index: 50;
-    pointer-events: none;
-  }
-
-  /* First-visit intro */
-  #introOverlay {
-    position: fixed; inset: 0; z-index: 1000;
-    background: rgba(0,0,0,.55);
-    display: none; align-items: center; justify-content: center;
-    padding: 16px;
-  }
-  #introCard {
-    max-width: 560px; width: 100%;
-    background: var(--card, #171512);
-    border: 1px solid rgba(245,158,11,.45);
-    border-radius: 16px;
-    padding: 22px 24px;
-    box-shadow: 0 16px 48px rgba(0,0,0,.5);
-  }
-  #introCard h2 { font-size: 18px; margin: 0 0 12px; color: var(--text); }
-  #introCard p { font-size: 13px; line-height: 1.55; color: var(--muted); margin: 0 0 10px; }
-  #introCard strong { color: var(--text); }
-
-  /* Switch */
-  .switch {
-    position: relative;
-    width: 44px;
-    height: 24px;
-    flex-shrink: 0;
-    margin-left: 14px;
-  }
-  .switch input {
-    opacity: 0;
-    width: 0;
-    height: 0;
-  }
+  .switch { position: relative; width: 44px; height: 24px; flex-shrink: 0; margin-left: 14px; }
+  .switch input { opacity: 0; width: 0; height: 0; }
   .slider {
-    position: absolute;
-    cursor: pointer;
-    inset: 0;
-    background: var(--border);
-    border-radius: 24px;
-    transition: background 0.2s ease;
+    position: absolute; cursor: pointer; inset: 0;
+    background: var(--border); border-radius: 24px; transition: background 0.2s ease;
   }
   .slider::before {
-    content: '';
-    position: absolute;
-    width: 18px;
-    height: 18px;
-    left: 3px;
-    bottom: 3px;
-    background: #fff;
-    border-radius: 50%;
-    transition: transform 0.2s ease;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+    content: ''; position: absolute; width: 18px; height: 18px; left: 3px; bottom: 3px;
+    background: #fff; border-radius: 50%; transition: transform 0.2s ease;
   }
-  .switch input:checked + .slider {
-    background: linear-gradient(135deg, var(--gold), var(--flame));
-  }
-  .switch input:checked + .slider::before {
-    transform: translateX(20px);
-  }
-  .switch.danger input:checked + .slider {
-    background: var(--err);
-  }
+  .switch input:checked + .slider { background: linear-gradient(135deg, var(--gold), var(--flame)); }
+  .switch input:checked + .slider::before { transform: translateX(20px); }
+  .switch.danger input:checked + .slider { background: var(--err); }
 
-  /* Warning Bar */
   .danger-alert {
     display: none;
     background: rgba(239, 68, 68, 0.1);
     border: 1px solid var(--err);
     border-radius: var(--radius);
-    padding: 13px 18px;
+    padding: 12px 16px;
     font-size: 12.5px;
     color: #fca5a5;
     margin-bottom: 16px;
     line-height: 1.5;
   }
 
-  /* Telemetry Grid */
   .telemetry-row {
     display: grid;
     grid-template-columns: repeat(4, 1fr);
     text-align: center;
+    margin-top: 16px;
+    padding-top: 14px;
+    border-top: 1px solid var(--border);
   }
-  .telemetry-col {
-    padding: 6px 12px;
-  }
-  .telemetry-col:not(:last-child) {
-    border-right: 1px solid var(--border);
-  }
-  .telemetry-val {
-    font-size: 22px;
-    font-weight: 800;
-    letter-spacing: -0.02em;
-    color: var(--text);
-  }
+  .telemetry-col { padding: 4px 8px; }
+  .telemetry-col:not(:last-child) { border-right: 1px solid var(--border); }
+  .telemetry-val { font-size: 20px; font-weight: 700; color: var(--text); }
   .telemetry-lbl {
-    font-size: 10px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.1em;
-    color: var(--muted);
-    margin-top: 3px;
+    font-size: 10px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.08em; color: var(--muted); margin-top: 2px;
   }
 
-  /* Background jobs */
-  .jobs-panel {
-    display: none;
-  }
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 12px;
-  }
-  th, td {
-    padding: 9px 12px;
-    text-align: left;
-    border-bottom: 1px solid var(--border);
-  }
+  .jobs-panel { display: none; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); }
   th {
-    color: var(--muted);
-    font-weight: 700;
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
+    color: var(--muted); font-weight: 700; font-size: 10px;
+    text-transform: uppercase; letter-spacing: 0.08em;
   }
+  .calls-list { max-height: 220px; overflow-y: auto; font-family: var(--mono); font-size: 11.5px; }
+  .call-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 6px 0; border-bottom: 1px solid var(--border);
+  }
+  .call-row:last-child { border-bottom: none; }
+  .pill { font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 4px; text-transform: uppercase; }
+  .pill.ok { background: rgba(34, 197, 94, 0.15); color: var(--ok); }
+  .pill.err { background: rgba(239, 68, 68, 0.15); color: var(--err); }
 
-  #msg {
-    color: var(--err);
-    font-size: 12px;
-    margin-top: 6px;
-    min-height: 16px;
-  }
+  #msg { color: var(--err); font-size: 12px; margin-top: 6px; min-height: 16px; }
 </style>
 </head>
 <body>
 <div class="container">
-  
-  <!-- Hero Section -->
+
   <header class="hero">
+    <div class="hero-title">Easy MCP</div>
     <div class="hero-badge">
       <span class="status-dot"></span>
       <span id="statusLine">INITIALIZING...</span>
     </div>
-    <br>
-    <div class="logo-mk">EASY MCP</div>
-    <p class="hero-subtitle">
-      Double your quota with <span class="glow-text">Antigravity</span>, <span class="glow-text">Claude Code</span>, <span class="glow-text">Codex</span> and more
-    </p>
   </header>
 
-  <!-- Danger banner if jail disabled -->
   <div class="danger-alert" id="jailWarn">
-    <strong>⚠ CRITICAL SECURITY ALERT:</strong> Folder jail is completely disabled (<kbd>--dangerously-skip-jail</kbd>). Connected AI clients have unrestrained read, write, and command execution access to the entire file system.
+    <strong>⚠ SECURITY ALERT:</strong> Folder jail is disabled (<kbd>--dangerously-skip-jail</kbd>). Connected clients have access to the entire filesystem.
   </div>
 
   <div class="grid">
 
-    <!-- Card 1: MCP Tunnel Endpoint & Integrations (Full Width) -->
     <div class="card span-full">
       <div class="card-header">
         <div class="card-title">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
-          Direct MCP Tunnel Endpoint
+          MCP Endpoint
         </div>
-        <span style="font-size: 11px; color: var(--muted);" id="stUptime">⏱ Uptime: --</span>
+        <span style="font-size: 11px; color: var(--muted);" id="stUptime">Uptime: --</span>
       </div>
 
       <div class="input-row">
         <input type="text" class="input-text" id="mcpUrl" readonly value="(establishing tunnel...)">
-        <button class="btn btn-primary" onclick="copyEl('mcpUrl', this)">
-          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-          Copy Link
-        </button>
+        <button class="btn btn-primary" onclick="copyEl('mcpUrl', this)">Copy Link</button>
       </div>
 
-      <div style="display:flex; align-items:center; gap:10px; margin-top:12px; flex-wrap:wrap;">
-        <span style="font-size:12px; color:var(--muted);">Tunnel:</span>
-        <div style="display:inline-flex; border:1px solid var(--border); border-radius:10px; overflow:hidden;">
-          <button id="tunCloudflare" onclick="setTunnel('cloudflare')" style="padding:7px 14px; font-size:12.5px; border:none; cursor:pointer; background:transparent; color:inherit;">Cloudflare</button>
-          <button id="tunFunnel" onclick="setTunnel('funnel')" style="padding:7px 14px; font-size:12.5px; border:none; cursor:pointer; background:transparent; color:inherit;">Tailscale · persistent link</button>
+      <div class="tunnel-bar">
+        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+          <span style="font-size:12px; color:var(--muted);">Tunnel:</span>
+          <div class="tunnel-seg">
+            <button id="tunCloudflare" class="tun-btn" onclick="setTunnel('cloudflare')">Cloudflare</button>
+            <button id="tunFunnel" class="tun-btn" onclick="setTunnel('funnel')">Tailscale Funnel</button>
+            <button id="tunNone" class="tun-btn" onclick="setTunnel('none')">Local only</button>
+          </div>
+          <span id="tunError" style="font-size:12px; color:var(--err);"></span>
         </div>
-        <span id="tunError" style="font-size:12px; color:#e5484d;"></span>
+
+        <div class="quick-links">
+          <span>Open:</span>
+          <a class="quick-link" href="https://claude.ai/plugins" target="_blank" rel="noopener">Claude</a>
+          <a class="quick-link" href="https://chatgpt.com/plugins" target="_blank" rel="noopener">ChatGPT</a>
+          <a class="quick-link" href="https://gemini.google.com/customize/connectors" target="_blank" rel="noopener">Gemini</a>
+        </div>
       </div>
 
-      <div class="connectors-strip">
-        <!-- Claude Web / Plugins -->
-        <a class="connector-card" href="https://claude.ai/plugins" target="_blank" title="Add custom MCP connector to Claude">
-          <svg viewBox="0 0 24 24" fill="none"><rect width="24" height="24" rx="5" fill="#D97757"/><path d="M12 4.5l1.8 5.4h5.7l-4.6 3.4 1.8 5.5-4.7-3.4-4.7 3.4 1.8-5.5-4.6-3.4h5.7z" fill="#FFF"/></svg>
-          <div class="connector-info">
-            <span class="c-name">Claude Plugins</span>
-            <span class="c-step">Add › Add custom connector</span>
-          </div>
-        </a>
-
-        <!-- ChatGPT Plugins -->
-        <a class="connector-card" href="https://chatgpt.com/plugins" target="_blank" title="Add custom MCP server to ChatGPT">
-          <svg viewBox="0 0 24 24" fill="none"><rect width="24" height="24" rx="5" fill="#10A37F"/><path d="M12 4a8 8 0 0 0-8 8c0 4.42 3.58 8 8 8s8-3.58 8-8a8 8 0 0 0-8-8zm0 2.5a5.5 5.5 0 0 1 5.5 5.5c0 1.25-.42 2.4-1.12 3.33l1.82 1.05a7.5 7.5 0 0 0-6.2-9.88V6.5zm-5.5 5.5a5.5 5.5 0 0 1 3.33-5.06V4.84a7.5 7.5 0 0 0-5.33 7.16h2zm3.33 5.06a5.5 5.5 0 0 1-3.33-5.06H4.5a7.5 7.5 0 0 0 9.77 7.02l-1.05-1.82a5.47 5.47 0 0 1-3.39-.14z" fill="#FFF"/></svg>
-          <div class="connector-info">
-            <span class="c-name">ChatGPT Plugins</span>
-            <span class="c-step">Add › Add custom MCP server</span>
-          </div>
-        </a>
-
-        <!-- Gemini Connectors -->
-        <a class="connector-card" href="https://gemini.google.com/customize/connectors" target="_blank" title="Add connector to Gemini">
-          <svg viewBox="0 0 24 24" fill="none"><rect width="24" height="24" rx="5" fill="#1E293B"/><path d="M12 3C12 7.97 7.97 12 3 12C7.97 12 12 16.03 12 21C12 16.03 16.03 12 21 12C16.03 12 12 7.97 12 3Z" fill="url(#geminiGrad)"/><defs><linearGradient id="geminiGrad" x1="3" y1="3" x2="21" y2="21"><stop stop-color="#4285F4"/><stop offset="0.5" stop-color="#9B72CB"/><stop offset="1" stop-color="#D96570"/></linearGradient></defs></svg>
-          <div class="connector-info">
-            <span class="c-name">Gemini Connectors</span>
-            <span class="c-step">Add connector</span>
-          </div>
-        </a>
+      <div class="token-bar">
+        <span>Access token (for OAuth / Bearer):</span>
+        <code class="token-code" id="tokenPreview">••••••••••••••••</code>
+        <button class="btn" style="padding:4px 10px;font-size:11.5px;" onclick="toggleToken(this)">Show</button>
+        <button class="btn" style="padding:4px 10px;font-size:11.5px;" onclick="copyToken(this)">Copy Token</button>
+        <span id="oauthMeta" style="margin-left:auto;">OAuth clients: 0</span>
+        <button class="btn" id="revokeOAuthBtn" style="padding:4px 10px;font-size:11.5px;display:none;" onclick="revokeOAuth()">Revoke OAuth</button>
       </div>
     </div>
 
-    <!-- Card 2: Active Workspace (Left Column) -->
     <div class="card">
       <div class="card-header">
         <div class="card-title">
@@ -1445,11 +1304,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       </div>
 
       <div class="input-row">
-        <input type="text" class="input-text" id="projectPath" placeholder="C:\\path\\to\\project" onkeydown="if(event.key==='Enter') setProject()">
-        <button class="btn" id="pickBtn" onclick="pickFolder(this)">
-          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-6l-2-2H5a2 2 0 0 0-2 2z"/></svg>
-          Browse
-        </button>
+        <input type="text" class="input-text" id="projectPath" placeholder="Path to project folder" onkeydown="if(event.key==='Enter') setProject()">
+        <button class="btn" id="pickBtn" onclick="pickFolder(this)">Browse</button>
       </div>
 
       <div class="recents-label">Recent Workspaces</div>
@@ -1457,7 +1313,6 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       <div id="msg"></div>
     </div>
 
-    <!-- Card 3: Security & Policies (Right Column) -->
     <div class="card">
       <div class="card-header">
         <div class="card-title">
@@ -1467,7 +1322,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       </div>
 
       <div class="toggle-group">
-        <div class="toggle-item" data-tip="The AI can read and search files but cannot write, edit or delete anything. Good for code review and Q&A sessions.">
+        <div class="toggle-item">
           <div class="toggle-meta">
             <div class="t-title">Read-Only Mode</div>
             <div class="t-desc">Prohibits all file writes and deletions</div>
@@ -1478,10 +1333,10 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
           </label>
         </div>
 
-        <div class="toggle-item" data-tip="Shell is off by default. The model reasons and searches on its own cloud VM; Easy MCP only syncs files. Turn shell on only for local test runs or builds — the model will ask when it needs it.">
+        <div class="toggle-item">
           <div class="toggle-meta">
             <div class="t-title">Disable Shell Execution</div>
-            <div class="t-desc">Shell is OFF by default. Models reason and search on their own cloud VMs — Easy MCP only syncs files. Turn shell on only when the model needs to run tests or a build on this machine.</div>
+            <div class="t-desc">Shell is OFF by default. Toggle off to allow tests or builds on this machine.</div>
           </div>
           <label class="switch">
             <input type="checkbox" id="togDisableShell" onchange="saveSetting('disableShell', this.checked)">
@@ -1489,10 +1344,10 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
           </label>
         </div>
 
-        <div class="toggle-item" data-tip="Removes the folder jail: the AI can reach the whole filesystem instead of just the project folder. Only for isolated VMs or a VPS. Dangerous on your main machine.">
+        <div class="toggle-item">
           <div class="toggle-meta">
             <div class="t-title" style="color: var(--err);">⚠ Disable Folder Jail</div>
-            <div class="t-desc">Allows AI to access the entire filesystem instead of just the project folder. <strong>Dangerous.</strong></div>
+            <div class="t-desc">Allows access to the entire filesystem instead of only the project folder.</div>
           </div>
           <label class="switch danger">
             <input type="checkbox" id="togSkipJail" onchange="toggleJail(this.checked)">
@@ -1504,24 +1359,23 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       <div class="telemetry-row">
         <div class="telemetry-col">
           <div class="telemetry-val" id="stCalls">0</div>
-          <div class="telemetry-lbl">Total Calls</div>
+          <div class="telemetry-lbl">Calls</div>
         </div>
         <div class="telemetry-col">
           <div class="telemetry-val" id="stErrors">0</div>
-          <div class="telemetry-lbl">Errors Encountered</div>
+          <div class="telemetry-lbl">Errors</div>
         </div>
         <div class="telemetry-col">
           <div class="telemetry-val" id="stSessions">0</div>
-          <div class="telemetry-lbl">Active Sessions</div>
+          <div class="telemetry-lbl">Sessions</div>
         </div>
         <div class="telemetry-col">
           <div class="telemetry-val" id="stTools">18</div>
-          <div class="telemetry-lbl">Registered Tools</div>
+          <div class="telemetry-lbl">Tools</div>
         </div>
       </div>
     </div>
 
-    <!-- Card 5: Background Jobs (Conditionally shown) -->
     <div class="card span-full jobs-panel" id="jobsCard">
       <div class="card-header">
         <div class="card-title">Active Background Jobs</div>
@@ -1529,48 +1383,62 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       <table><tbody id="jobsBody"></tbody></table>
     </div>
 
-    <!-- Share AI Slot promo (dismissible banner, bottom-right) -->
-    <div id="slotPromo" style="position:fixed;right:16px;bottom:16px;width:300px;max-width:calc(100vw - 32px);z-index:999;background:var(--card,#171512);border:1px solid rgba(245,158,11,.45);border-radius:14px;padding:14px 16px;box-shadow:0 10px 30px rgba(0,0,0,.45);">
-      <button onclick="closeSlotPromo()" title="Close" style="position:absolute;top:6px;right:10px;background:none;border:none;color:inherit;font-size:16px;cursor:pointer;opacity:.7;">×</button>
-      <div style="font-size:14px;font-weight:700;padding-right:18px;">Need a Google family slot or an AI subscription? Got a spare one to sell?</div>
-      <div style="margin-top:6px;font-size:12.5px;opacity:.85;">From $1/month, varies by country — every family member gets their own Gemini quota.</div>
-      <a href="https://mrkaylabs.github.io/share-ai-slot/" target="_blank" rel="noopener" style="display:inline-block;margin-top:10px;padding:8px 18px;border-radius:999px;background:linear-gradient(90deg,#f59e0b,#ea580c);color:#fff;font-weight:700;text-decoration:none;font-size:13px;">Share AI Slot →</a>
+    <div class="card span-full">
+      <div class="card-header">
+        <div class="card-title">Recent Tool Calls</div>
+        <span style="font-size: 11px; color: var(--muted);" id="callsEmpty">No calls yet</span>
+      </div>
+      <div class="calls-list" id="callsList"></div>
     </div>
 
   </div>
 </div>
 
-<!-- First-visit intro -->
-<div id="introOverlay">
-  <div id="introCard">
-    <h2>Welcome to Easy MCP</h2>
-    <p>Easy MCP connects this folder to your web AI through the <strong>built-in MCP connector</strong> of Gemini, Claude or ChatGPT — the standard, official way those clients talk to tools. <strong>No wrapper, no proxy, no browser automation, no cookies, no login scraping.</strong> You chat in the web AI yourself; the model calls these tools through its own connector.</p>
-    <p>What the tools do is replace manual hand operations: reading a file, editing code, listing a folder — the same things you would copy-paste by hand, automated.</p>
-    <p>All reasoning and web search happen on the model's cloud infrastructure. <strong>Nothing runs on this machine unless you grant it:</strong> file access is jailed to your project folder, and shell is off by default — it is almost only needed to run tests, and the model will ask when it does.</p>
-    <p>Keep your MCP link private — it is the key to this folder.</p>
-    <button class="btn" onclick="closeIntro()" style="margin-top:6px;padding:9px 22px;">Got it</button>
-  </div>
-</div>
-
 <script>
 const ADMIN = '__EASY_MCP_ADMIN__';
-const q = '';
+let currentToken = '';
+let tokenVisible = false;
 
 function esc(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+function copyText(text, btn){
+  navigator.clipboard.writeText(text).then(() => {
+    const orig = btn.textContent;
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = orig; }, 1400);
+  });
+}
 
 function copyEl(id, btn){
   const el = document.getElementById(id);
   el.select();
-  navigator.clipboard.writeText(el.value).then(() => {
-    const orig = btn.innerHTML;
-    btn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="20 6 9 17 4 12"/></svg> Copied!';
-    setTimeout(() => { btn.innerHTML = orig; }, 1400);
+  copyText(el.value, btn);
+}
+
+function toggleToken(btn){
+  tokenVisible = !tokenVisible;
+  btn.textContent = tokenVisible ? 'Hide' : 'Show';
+  document.getElementById('tokenPreview').textContent = tokenVisible ? (currentToken || '—') : '••••••••••••••••';
+}
+
+function copyToken(btn){
+  if (!currentToken) return;
+  copyText(currentToken, btn);
+}
+
+async function revokeOAuth(){
+  if (!confirm('Revoke all saved OAuth clients and access tokens? Connected web clients using OAuth will need to re-authorize.')) return;
+  await fetch('/api/revoke-oauth', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Easy-Mcp-Admin': ADMIN },
+    body: '{}'
   });
+  tick();
 }
 
 async function setTunnel(mode){
   document.getElementById('mcpUrl').value = '(switching tunnel...)';
-  await fetch('/api/set-tunnel' + q, {
+  await fetch('/api/set-tunnel', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Easy-Mcp-Admin': ADMIN },
     body: JSON.stringify({ mode })
@@ -1581,7 +1449,7 @@ async function setTunnel(mode){
 async function setProject(pathOverride){
   const p = pathOverride || document.getElementById('projectPath').value.trim();
   if (!p) return;
-  const res = await fetch('/api/set-project' + q, {
+  const res = await fetch('/api/set-project', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Easy-Mcp-Admin': ADMIN },
     body: JSON.stringify({ path: p })
@@ -1592,26 +1460,24 @@ async function setProject(pathOverride){
 }
 
 async function pickFolder(btn){
-  const orig = btn.innerHTML;
+  const orig = btn.textContent;
   btn.disabled = true;
-  btn.innerHTML = 'Browsing...';
+  btn.textContent = 'Browsing...';
   document.getElementById('msg').textContent = '';
   const hintTimer = setTimeout(() => {
     document.getElementById('msg').textContent = 'Dialog open — check your taskbar if you don\\'t see it, or paste a path directly.';
   }, 5000);
   try {
-    const res = await fetch('/api/pick-folder' + q, {
+    const res = await fetch('/api/pick-folder', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Easy-Mcp-Admin': ADMIN },
       body: '{}'
     });
     const d = await res.json();
-    if (d.success) {
-      document.getElementById('msg').textContent = '';
-    } else if (d.status === 'cancelled') {
+    if (d.success || d.status === 'cancelled') {
       document.getElementById('msg').textContent = '';
     } else if (d.status === 'busy') {
-      document.getElementById('msg').textContent = 'Folder picker is already open — check your taskbar.';
+      document.getElementById('msg').textContent = 'Folder picker is already open.';
     } else {
       document.getElementById('msg').textContent = 'Couldn\\'t open folder picker. Please paste the folder path directly.';
     }
@@ -1620,7 +1486,7 @@ async function pickFolder(btn){
   }
   clearTimeout(hintTimer);
   btn.disabled = false;
-  btn.innerHTML = orig;
+  btn.textContent = orig;
   tick();
 }
 
@@ -1628,7 +1494,7 @@ async function saveSetting(key, value){
   try {
     const body = {};
     body[key] = value;
-    await fetch('/api/settings' + q, {
+    await fetch('/api/settings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Easy-Mcp-Admin': ADMIN },
       body: JSON.stringify(body)
@@ -1655,7 +1521,7 @@ async function toggleJail(checked){
 }
 
 async function stopJob(id){
-  await fetch('/api/stop-job' + q, {
+  await fetch('/api/stop-job', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Easy-Mcp-Admin': ADMIN },
     body: JSON.stringify({ id })
@@ -1671,10 +1537,9 @@ function fmtUptime(s){
 
 async function tick(){
   try {
-    const res = await fetch('/api/dashboard' + q, { headers: { 'X-Easy-Mcp-Admin': ADMIN } });
+    const res = await fetch('/api/dashboard', { headers: { 'X-Easy-Mcp-Admin': ADMIN } });
     const d = await res.json();
-    
-    // Status line in badge
+
     const badgeParts = ['ONLINE', 'v' + (d.version || '?'), d.project];
     if (d.readOnly) badgeParts.push('READ-ONLY');
     if (d.disableShell) badgeParts.push('SHELL OFF');
@@ -1686,35 +1551,34 @@ async function tick(){
     document.getElementById('togDisableShell').checked = d.disableShell;
     document.getElementById('togSkipJail').checked = d.skipJail;
 
-    document.getElementById('mcpUrl').value = d.mcpUrl || '(tunnel starting...)';
-    const tc = document.getElementById('tunCloudflare'), tf = document.getElementById('tunFunnel');
-    if (tc && tf) {
-      const on = 'background:var(--accent, #6c5ce7); color:#fff; font-weight:600;';
-      const off = 'background:transparent; color:inherit; font-weight:400;';
-      tc.style.cssText += (d.tunnelMode === 'cloudflare' ? on : off);
-      tf.style.cssText += (d.tunnelMode === 'funnel' ? on : off);
-    }
+    currentToken = d.token || '';
+    if (tokenVisible) document.getElementById('tokenPreview').textContent = currentToken || '—';
+    document.getElementById('oauthMeta').textContent = 'OAuth clients: ' + (d.oauthClientsCount || 0);
+    document.getElementById('revokeOAuthBtn').style.display = (d.oauthClientsCount || d.oauthTokensCount) ? 'inline-flex' : 'none';
+
+    document.getElementById('mcpUrl').value = d.mcpUrl || (d.tunnelMode === 'none' ? 'http://127.0.0.1:' + location.port + '/mcp' : '(tunnel starting...)');
+    document.getElementById('tunCloudflare').classList.toggle('active', d.tunnelMode === 'cloudflare');
+    document.getElementById('tunFunnel').classList.toggle('active', d.tunnelMode === 'funnel');
+    document.getElementById('tunNone').classList.toggle('active', d.tunnelMode === 'none');
+
     const te = document.getElementById('tunError');
     if (te) te.textContent = d.tunnelError || '';
-    
+
     const pp = document.getElementById('projectPath');
     if (document.activeElement !== pp) pp.value = d.project;
 
-    // Recents
     document.getElementById('recent').innerHTML = d.recentProjects.slice(0, 5).map(p =>
       '<button class="recent-item' + (p === d.project ? ' active' : '') + '" onclick="setProject(' + JSON.stringify(p).replace(/"/g, '&quot;') + ')">' +
       esc(p) + (p === d.project ? '<span class="tag">CURRENT</span>' : '') +
       '</button>'
     ).join('');
 
-    // Telemetry
-    document.getElementById('stUptime').textContent = '⏱ Uptime: ' + fmtUptime(d.uptimeSec);
-    const elCalls = document.getElementById('stCalls'); if (elCalls) elCalls.textContent = d.totalCalls;
+    document.getElementById('stUptime').textContent = 'Uptime: ' + fmtUptime(d.uptimeSec);
+    document.getElementById('stCalls').textContent = d.totalCalls;
     document.getElementById('stErrors').textContent = d.totalErrors;
-    document.getElementById('stSessions').textContent = d.sseSessions;
+    document.getElementById('stSessions').textContent = d.activeSessions;
     document.getElementById('stTools').textContent = d.toolsCount;
 
-    // Background jobs
     const jobsCard = document.getElementById('jobsCard');
     jobsCard.style.display = d.jobs.length ? 'block' : 'none';
     document.getElementById('jobsBody').innerHTML = d.jobs.map(j =>
@@ -1723,22 +1587,21 @@ async function tick(){
       '</td></tr>'
     ).join('');
 
+    const calls = d.recentCalls || [];
+    document.getElementById('callsEmpty').style.display = calls.length ? 'none' : 'inline';
+    document.getElementById('callsList').innerHTML = calls.slice(0, 25).map(c =>
+      '<div class="call-row">' +
+      '<span class="pill ' + (c.ok ? 'ok' : 'err') + '">' + (c.ok ? 'ok' : 'err') + '</span>' +
+      '<strong>' + esc(c.tool) + '</strong>' +
+      '<span style="color:var(--muted);">' + c.ms + 'ms</span>' +
+      '<span style="margin-left:auto;color:var(--muted);">' + esc(c.ts.slice(11, 19)) + '</span>' +
+      '</div>'
+    ).join('');
+
   } catch (e) {
     document.getElementById('statusLine').textContent = 'SERVER DISCONNECTED';
   }
 }
-
-function closeSlotPromo(){
-  document.getElementById('slotPromo').style.display = 'none';
-}
-
-function closeIntro(){
-  try { localStorage.setItem('emcp-intro-seen', '1'); } catch (e) {}
-  document.getElementById('introOverlay').style.display = 'none';
-}
-try {
-  if (!localStorage.getItem('emcp-intro-seen')) document.getElementById('introOverlay').style.display = 'flex';
-} catch (e) {}
 
 tick();
 setInterval(tick, 2000);
@@ -1753,7 +1616,86 @@ const oauthTokensFile = path.join(easyMcpHome, 'oauth-tokens.json');
 function loadOAuthStore(file) { try { return new Map(Object.entries(JSON.parse(fs.readFileSync(file, 'utf8')))); } catch { return new Map(); } }
 const oauthClients = loadOAuthStore(oauthClientsFile); // client_id -> { secretHash, redirect_uris, authMethod, createdAt }
 const oauthTokens = loadOAuthStore(oauthTokensFile);   // sha256(token) -> { type, clientId, exp, createdAt }
+function escHtml(s) {
+  return String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function renderAuthorizePage({ clientId, redirectUri, state, challenge, method, responseType, errorMsg = '' }) {
+  let targetOrigin = redirectUri;
+  try { targetOrigin = new URL(redirectUri).origin; } catch {}
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authorize Easy MCP Access</title>
+<style>
+  :root { color-scheme: dark light; --bg:#0d0c0a; --card:#151311; --border:#29241f; --text:#f5f0eb; --muted:#96897b; --err:#ef4444; }
+  @media (prefers-color-scheme: light) { :root { --bg:#faf7f2; --card:#fff; --border:#e8e0d5; --text:#1d1916; --muted:#706356; } }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; background:var(--bg); color:var(--text); min-height:100vh; display:flex; align-items:center; justify-content:center; padding:20px; }
+  .card { width:100%; max-width:440px; background:var(--card); border:1px solid var(--border); border-radius:12px; padding:24px; }
+  h1 { font-size:18px; margin-bottom:8px; }
+  p { font-size:13px; color:var(--muted); line-height:1.5; margin-bottom:14px; }
+  .meta { font-family: ui-monospace, monospace; font-size:12px; background:rgba(127,127,127,.08); border:1px solid var(--border); border-radius:8px; padding:10px 12px; margin-bottom:14px; word-break:break-all; }
+  label { display:block; font-size:12px; font-weight:600; margin-bottom:6px; }
+  input[type=password] { width:100%; padding:10px 12px; border-radius:8px; border:1px solid var(--border); background:transparent; color:var(--text); font-family:ui-monospace, monospace; font-size:13px; margin-bottom:14px; }
+  .err { color:var(--err); font-size:12.5px; margin-bottom:12px; }
+  .row { display:flex; gap:8px; }
+  button { flex:1; padding:10px 14px; border-radius:8px; border:1px solid var(--border); cursor:pointer; font-weight:600; font-size:13px; background:transparent; color:var(--text); }
+  button.primary { background:linear-gradient(135deg,#f59e0b,#d9480f); border-color:#d9480f; color:#fff; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Authorize Easy MCP Client</h1>
+  <p>An application is requesting OAuth access to your Easy MCP server. Enter your Easy MCP access token (shown in your local dashboard or <code>~/.easy-mcp/token</code>) to approve.</p>
+  <div class="meta">
+    <div><strong>Client:</strong> ${escHtml(clientId)}</div>
+    <div><strong>Redirect:</strong> ${escHtml(targetOrigin)}</div>
+  </div>
+  ${errorMsg ? `<div class="err">${escHtml(errorMsg)}</div>` : ''}
+  <form method="POST" action="/oauth/authorize">
+    <input type="hidden" name="client_id" value="${escHtml(clientId)}">
+    <input type="hidden" name="redirect_uri" value="${escHtml(redirectUri)}">
+    <input type="hidden" name="state" value="${escHtml(state)}">
+    <input type="hidden" name="code_challenge" value="${escHtml(challenge)}">
+    <input type="hidden" name="code_challenge_method" value="${escHtml(method)}">
+    <input type="hidden" name="response_type" value="${escHtml(responseType)}">
+    <label for="tok">Easy MCP Access Token</label>
+    <input id="tok" type="password" name="token" autocomplete="off" required placeholder="Paste access token">
+    <div class="row">
+      <button type="submit" name="action" value="deny" formnovalidate>Deny</button>
+      <button type="submit" name="action" value="approve" class="primary">Authorize</button>
+    </div>
+  </form>
+</div>
+</body>
+</html>`;
+}
+
+function validateAuthorizeParams(params) {
+  const redirectUri = params.get('redirect_uri');
+  const state = params.get('state') || '';
+  const clientId = params.get('client_id') || '';
+  const responseType = params.get('response_type') || '';
+  const challenge = params.get('code_challenge') || '';
+  const method = params.get('code_challenge_method') || 'S256';
+  const client = oauthClients.get(clientId);
+  if (!redirectUri) return { noRedirect: true };
+  if (!client) return { error: 'invalid_client', error_description: 'Unknown client_id — register first' };
+  if (responseType !== 'code') return { error: 'unsupported_response_type' };
+  if (!challenge && client.authMethod === 'none') return { error: 'invalid_request', error_description: 'code_challenge (PKCE) is required for public clients' };
+  const uriOk = client.redirect_uris.length ? client.redirect_uris.includes(redirectUri) : validRedirectUri(redirectUri);
+  if (!uriOk) return { error: 'invalid_redirect_uri' };
+  return { ok: true, clientId, redirectUri, state, challenge, method, responseType };
+}
+
 function saveOAuth() {
+  const now = Date.now();
+  for (const [k, v] of oauthTokens) {
+    if (v.type === 'access' && v.exp && v.exp < now) oauthTokens.delete(k);
+  }
   try {
     fs.mkdirSync(easyMcpHome, { recursive: true, mode: 0o700 });
     for (const [file, map] of [[oauthClientsFile, oauthClients], [oauthTokensFile, oauthTokens]]) {
@@ -1895,36 +1837,50 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 201, out);
     }
 
-    if (url.pathname === '/oauth/authorize') {
-      const redirectUri = url.searchParams.get('redirect_uri');
-      const state = url.searchParams.get('state') || '';
-      const clientId = url.searchParams.get('client_id') || '';
-      const client = oauthClients.get(clientId);
-      if (redirectUri) {
-        if (!client) return sendJson(res, 400, { error: 'invalid_client', error_description: 'Unknown client_id — register first' });
-        if (url.searchParams.get('response_type') !== 'code') return sendJson(res, 400, { error: 'unsupported_response_type' });
-        const challenge = url.searchParams.get('code_challenge') || '';
-        if (!challenge && client.authMethod === 'none') return sendJson(res, 400, { error: 'invalid_request', error_description: 'code_challenge (PKCE) is required for public clients' });
-        const uriOk = client.redirect_uris.length ? client.redirect_uris.includes(redirectUri) : validRedirectUri(redirectUri);
-        if (!uriOk) return sendJson(res, 400, { error: 'invalid_redirect_uri' });
-        const code = crypto.randomBytes(32).toString('hex');
-        oauthCodes.set(code, {
-          exp: Date.now() + 600000,
-          challenge,
-          method: url.searchParams.get('code_challenge_method') || 'S256',
-          clientId,
-          redirectUri
-        });
-        if (oauthCodes.size > 100) { for (const [k, v] of oauthCodes) { if (v.exp < Date.now()) oauthCodes.delete(k); } }
-        const target = new URL(redirectUri);
-        target.searchParams.set('code', code);
-        if (state) target.searchParams.set('state', state);
-        const issBase = publicUrl || `http://${req.headers.host || '127.0.0.1:' + PORT}`;
-        target.searchParams.set('iss', issBase);
-        res.writeHead(302, { Location: target.toString() });
-        return res.end();
+    const sendHtml = (code, html) => {
+      res.writeHead(code, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY' });
+      return res.end(html);
+    };
+    const sendOAuthError = (v) => sendJson(res, 400, { error: v.error, ...(v.error_description ? { error_description: v.error_description } : {}) });
+    const redirectWithParams = (baseUri, params) => {
+      const target = new URL(baseUri);
+      for (const [k, val] of Object.entries(params)) {
+        if (val !== undefined && val !== '') target.searchParams.set(k, val);
       }
-      return sendJson(res, 200, { status: 'authorized' });
+      res.writeHead(302, { Location: target.toString() });
+      return res.end();
+    };
+
+    if (url.pathname === '/oauth/authorize' && req.method === 'GET') {
+      const v = validateAuthorizeParams(url.searchParams);
+      if (v.noRedirect) return sendJson(res, 200, { status: 'authorization_endpoint' });
+      if (v.error) return sendOAuthError(v);
+      return sendHtml(200, renderAuthorizePage(v));
+    }
+
+    if (url.pathname === '/oauth/authorize' && req.method === 'POST') {
+      const form = new URLSearchParams(await readBody(req, 65536));
+      const v = validateAuthorizeParams(form);
+      if (v.noRedirect) return sendJson(res, 400, { error: 'invalid_request', error_description: 'redirect_uri required' });
+      if (v.error) return sendOAuthError(v);
+      if (form.get('action') === 'deny') {
+        return redirectWithParams(v.redirectUri, { error: 'access_denied', state: v.state });
+      }
+      const submittedToken = (form.get('token') || '').trim();
+      if (!safeEqual(submittedToken, TOKEN)) {
+        return sendHtml(401, renderAuthorizePage({ ...v, errorMsg: 'Invalid access token.' }));
+      }
+      const code = crypto.randomBytes(32).toString('hex');
+      oauthCodes.set(code, {
+        exp: Date.now() + 600000,
+        challenge: v.challenge,
+        method: v.method,
+        clientId: v.clientId,
+        redirectUri: v.redirectUri
+      });
+      if (oauthCodes.size > 100) { for (const [k, info] of oauthCodes) { if (info.exp < Date.now()) oauthCodes.delete(k); } }
+      const issBase = publicUrl || `http://${req.headers.host || '127.0.0.1:' + PORT}`;
+      return redirectWithParams(v.redirectUri, { code, state: v.state, iss: issBase });
     }
 
     if (url.pathname === '/oauth/token' && req.method === 'POST') {
@@ -2006,10 +1962,10 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && url.pathname === '/api/status') {
       const d = dashboardData();
-      return sendJson(res, 200, { status: d.status, project: d.project, toolsCount: d.toolsCount, sseSessions: d.sseSessions, uptimeSec: d.uptimeSec });
+      return sendJson(res, 200, { status: d.status, project: d.project, toolsCount: d.toolsCount, activeSessions: d.activeSessions, uptimeSec: d.uptimeSec });
     }
     if (req.method === 'POST' && url.pathname === '/api/set-project') {
-      const { path: p } = JSON.parse(await readBody(req) || '{}');
+      const { path: p } = parseJsonBody(await readBody(req));
       try { setProject(p); return sendJson(res, 200, { success: true, project: projectRoot }); }
       catch (err) { return sendJson(res, 400, { success: false, error: err.message }); }
     }
@@ -2024,7 +1980,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { success: false, status: result.status, error: result.error || null });
     }
     if (req.method === 'POST' && url.pathname === '/api/set-tunnel') {
-      const { mode } = JSON.parse(await readBody(req) || '{}');
+      const { mode } = parseJsonBody(await readBody(req));
       try {
         await setTunnel(mode);
         return sendJson(res, 200, { success: !tunnelError, tunnelMode, publicUrl: publicUrl || null, error: tunnelError || null });
@@ -2033,24 +1989,31 @@ const server = http.createServer(async (req, res) => {
       }
     }
     if (req.method === 'POST' && url.pathname === '/api/set-public-url') {
-      const { url: u } = JSON.parse(await readBody(req) || '{}');
+      const { url: u } = parseJsonBody(await readBody(req));
       const clean = String(u || '').trim().replace(/\/+$/, '');
       if (!/^https:\/\//.test(clean)) return sendJson(res, 400, { success: false, error: 'url must be https://...' });
       publicUrl = clean;
       return sendJson(res, 200, { success: true, publicUrl });
     }
+    if (req.method === 'POST' && url.pathname === '/api/revoke-oauth') {
+      oauthClients.clear();
+      oauthTokens.clear();
+      oauthCodes.clear();
+      saveOAuth();
+      return sendJson(res, 200, { success: true });
+    }
     if (req.method === 'GET' && url.pathname === '/api/settings') {
       return sendJson(res, 200, { readOnly: READ_ONLY, disableShell: DISABLE_SHELL, skipJail: SKIP_JAIL });
     }
     if (req.method === 'POST' && url.pathname === '/api/settings') {
-      const body = JSON.parse(await readBody(req) || '{}');
+      const body = parseJsonBody(await readBody(req));
       if (typeof body.readOnly === 'boolean') READ_ONLY = body.readOnly;
       if (typeof body.disableShell === 'boolean') DISABLE_SHELL = body.disableShell;
       if (typeof body.skipJail === 'boolean') SKIP_JAIL = body.skipJail;
       return sendJson(res, 200, { success: true, readOnly: READ_ONLY, disableShell: DISABLE_SHELL, skipJail: SKIP_JAIL });
     }
     if (req.method === 'POST' && url.pathname === '/api/stop-job') {
-      const { id } = JSON.parse(await readBody(req) || '{}');
+      const { id } = parseJsonBody(await readBody(req));
       const job = jobs.get(id);
       if (!job) return sendJson(res, 404, { success: false, error: 'Unknown job' });
       killJob(job);
@@ -2058,7 +2021,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { success: true });
     }
     if (req.method === 'POST' && url.pathname === '/call') {
-      const { name, arguments: toolArgs } = JSON.parse(await readBody(req) || '{}');
+      const { name, arguments: toolArgs } = parseJsonBody(await readBody(req));
       try { return sendJson(res, 200, { success: true, result: await callTool(name, toolArgs) }); }
       catch (err) { return sendJson(res, 400, { success: false, error: err.message }); }
     }
@@ -2071,7 +2034,10 @@ const server = http.createServer(async (req, res) => {
       let sessionId = req.headers['mcp-session-id'];
       if (isInit) {
         sessionId = crypto.randomBytes(16).toString('hex');
-        mcpSessions.set(sessionId, { createdAt: Date.now() });
+        mcpSessions.set(sessionId, { createdAt: Date.now(), lastSeen: Date.now() });
+        pruneMcpSessions();
+      } else if (sessionId && mcpSessions.has(sessionId)) {
+        mcpSessions.get(sessionId).lastSeen = Date.now();
       }
       const outs = [];
       for (const m of messages) {
@@ -2140,7 +2106,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/messages') {
       const sessionId = url.searchParams.get('sessionId');
       const sse = sseSessions.get(sessionId);
-      const msg = JSON.parse(await readBody(req) || '{}');
+      const msg = parseJsonBody(await readBody(req));
       const out = await handleRpc(msg);
       if (out && sse) sse.write(`event: message\ndata: ${JSON.stringify(out)}\n\n`);
       res.writeHead(202);
@@ -2148,7 +2114,7 @@ const server = http.createServer(async (req, res) => {
     }
     return sendJson(res, 404, { error: 'Not found' });
   } catch (err) {
-    return sendJson(res, 500, { error: err.message });
+    return sendJson(res, err.statusCode || 500, { error: err.message });
   }
 });
 
