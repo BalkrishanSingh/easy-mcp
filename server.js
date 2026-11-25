@@ -958,25 +958,6 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     flex-wrap: wrap;
   }
 
-  .quick-links {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-    font-size: 11.5px;
-    color: var(--muted);
-  }
-  .quick-link {
-    padding: 4px 10px;
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    color: var(--text);
-    text-decoration: none;
-    background: var(--card-elevated);
-    font-size: 11.5px;
-  }
-  .quick-link:hover { border-color: var(--gold); }
-
   .recents-label {
     font-size: 10.5px;
     font-weight: 700;
@@ -1127,13 +1108,6 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
           <span style="font-size:12px; color:var(--muted);">Tailscale Funnel</span>
           <span id="tunError" style="font-size:12px; color:var(--err);"></span>
-        </div>
-
-        <div class="quick-links">
-          <span>Open:</span>
-          <a class="quick-link" href="https://claude.ai/plugins" target="_blank" rel="noopener">Claude</a>
-          <a class="quick-link" href="https://chatgpt.com/plugins" target="_blank" rel="noopener">ChatGPT</a>
-          <a class="quick-link" href="https://gemini.google.com/customize/connectors" target="_blank" rel="noopener">Gemini</a>
         </div>
       </div>
     </div>
