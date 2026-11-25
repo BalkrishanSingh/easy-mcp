@@ -98,8 +98,8 @@ function killOldInstances() {
         }
       }
       for (const pid of pids) {
-        const comm = (spawnSync('ps', ['-p', String(pid), '-o', 'args='], { encoding: 'utf8' }).stdout || '').trim();
-        if (comm.includes('node') && (comm.includes(serverPath) || comm.includes('easy-mcp'))) {
+        const cmdArgs = (spawnSync('ps', ['-p', String(pid), '-o', 'args='], { encoding: 'utf8' }).stdout || '').trim();
+        if (cmdArgs.includes('node') && (cmdArgs.includes(serverPath) || cmdArgs.includes('easy-mcp'))) {
           try { process.kill(pid, 'SIGKILL'); } catch {}
         }
       }

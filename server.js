@@ -80,22 +80,30 @@ let publicUrl = (process.env.EASY_MCP_PUBLIC_URL || '').replace(/\/+$/, '');
 const easyMcpHome = path.join(os.homedir(), '.easy-mcp');
 let tunnelError = '';
 
-function startTunnel() {
+function execFileAsync(file, fileArgs, timeout) {
+  return new Promise((resolve) => {
+    execFile(file, fileArgs, { encoding: 'utf8', timeout }, (error, stdout, stderr) => {
+      resolve({ ok: !error, stdout: stdout || '', stderr: stderr || '', error });
+    });
+  });
+}
+
+async function startTunnel() {
   tunnelError = '';
-  const funnel = spawnSync('tailscale', ['funnel', '--bg', String(PORT)], { encoding: 'utf8', timeout: 20000 });
-  if (funnel.error || funnel.status !== 0) {
-    const detail = (funnel.stderr || funnel.stdout || funnel.error?.message || '').trim();
-    tunnelError = detail || 'Tailscale Funnel failed to start. Check that Tailscale is running and Funnel is enabled.';
-    return;
-  }
+  const funnel = await execFileAsync('tailscale', ['funnel', '--bg', String(PORT)], 20000);
   let dnsHost = '';
-  try {
-    const st = spawnSync('tailscale', ['status', '--json'], { encoding: 'utf8', timeout: 15000 });
-    dnsHost = JSON.parse(st.stdout || '{}').Self?.DNSName?.replace(/\.$/, '') || '';
-  } catch {}
+  if (funnel.ok) {
+    const st = await execFileAsync('tailscale', ['status', '--json'], 15000);
+    if (st.ok) {
+      try { dnsHost = JSON.parse(st.stdout || '{}').Self?.DNSName?.replace(/\.$/, '') || ''; } catch {}
+    }
+  }
   dnsHost = dnsHost || process.env.EASY_MCP_FUNNEL_HOST || '';
   if (!dnsHost) {
-    tunnelError = 'Tailscale not found or not signed in. Install: https://tailscale.com/download';
+    const detail = (funnel.stderr || funnel.stdout || funnel.error?.message || '').trim();
+    tunnelError = !funnel.ok && detail
+      ? detail
+      : 'Tailscale not found or not signed in. Install: https://tailscale.com/download';
     return;
   }
   publicUrl = 'https://' + dnsHost;
@@ -770,6 +778,7 @@ function dashboardData() {
     skipJail: SKIP_JAIL,
     toolsCount: TOOLS.length,
     toolNames: TOOLS.map(t => t.name),
+    sseSessions: sseSessions.size,
     activeSessions: sseSessions.size + mcpSessions.size,
     uptimeSec: Math.floor((Date.now() - startedAt) / 1000),
     startedAt: new Date(startedAt).toISOString(),
@@ -1645,7 +1654,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && url.pathname === '/api/status') {
       const d = dashboardData();
-      return sendJson(res, 200, { status: d.status, project: d.project, toolsCount: d.toolsCount, activeSessions: d.activeSessions, uptimeSec: d.uptimeSec });
+      return sendJson(res, 200, { status: d.status, project: d.project, toolsCount: d.toolsCount, sseSessions: d.sseSessions, activeSessions: d.activeSessions, uptimeSec: d.uptimeSec });
     }
     if (req.method === 'POST' && url.pathname === '/api/set-project') {
       const { path: p } = parseJsonBody(await readBody(req));
@@ -1715,6 +1724,21 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, headers);
       return res.end(body);
     }
+    const openSseStream = (sessionId, buildUri, pingMs, pingPayload, padProxy) => {
+      if (req.socket) { req.socket.setKeepAlive(true, 10000); req.socket.setNoDelay(true); }
+      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+      const sseToken = crypto.randomBytes(16).toString('hex');
+      sseSessionTokens.set(sessionId, sseToken);
+      sseSessions.set(sessionId, res);
+      if (padProxy) res.write(`: ${' '.repeat(4096)}\n\n`);
+      res.write(`event: endpoint\ndata: ${buildUri(sseToken)}\n\n`);
+      const ping = setInterval(() => { try { res.write(pingPayload); } catch {} }, pingMs);
+      const cleanup = () => { clearInterval(ping); sseSessions.delete(sessionId); sseSessionTokens.delete(sessionId); };
+      req.on('close', cleanup);
+      res.on('close', cleanup);
+      res.on('error', cleanup);
+    };
+
     if (url.pathname === '/mcp' && req.method === 'GET') {
       const accept = req.headers.accept || '';
       if (!accept.includes('text/event-stream')) {
@@ -1728,22 +1752,10 @@ const server = http.createServer(async (req, res) => {
         });
       }
       // Legacy SSE transport: pad to flush proxy buffers, then send the endpoint event.
-      if (req.socket) { req.socket.setKeepAlive(true, 10000); req.socket.setNoDelay(true); }
-      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
       const proto = req.headers['x-forwarded-proto'] || 'https';
       const host = req.headers['x-forwarded-host'] || req.headers.host;
       const sseId = crypto.randomBytes(16).toString('hex');
-      const sseToken = crypto.randomBytes(16).toString('hex');
-      sseSessionTokens.set(sseId, sseToken);
-      const endpointUri = `${proto}://${host}/mcp?sessionId=${sseId}&token=${sseToken}`;
-      res.write(`: ${' '.repeat(4096)}\n\n`);
-      res.write(`event: endpoint\ndata: ${endpointUri}\n\n`);
-      sseSessions.set(sseId, res);
-      const ping = setInterval(() => { try { res.write(': ping\n\n'); res.write('event: ping\ndata: {}\n\n'); } catch {} }, 20000);
-      const cleanup = () => { clearInterval(ping); sseSessions.delete(sseId); sseSessionTokens.delete(sseId); };
-      req.on('close', cleanup);
-      res.on('close', cleanup);
-      res.on('error', cleanup);
+      openSseStream(sseId, t => `${proto}://${host}/mcp?sessionId=${sseId}&token=${t}`, 20000, ': ping\n\nevent: ping\ndata: {}\n\n', true);
       return;
     }
     if (url.pathname === '/mcp' && req.method === 'DELETE') {
@@ -1753,19 +1765,8 @@ const server = http.createServer(async (req, res) => {
       return res.end();
     }
     if (req.method === 'GET' && url.pathname === '/sse') {
-      if (req.socket) { req.socket.setKeepAlive(true, 10000); req.socket.setNoDelay(true); }
       const sessionId = crypto.randomBytes(8).toString('hex');
-      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
-      sseSessions.set(sessionId, res);
-      const sseToken = crypto.randomBytes(16).toString('hex');
-      sseSessionTokens.set(sessionId, sseToken);
-      const q = TOKEN ? `?token=${sseToken}&sessionId=${sessionId}` : `?sessionId=${sessionId}`;
-      res.write(`event: endpoint\ndata: /messages${q}\n\n`);
-      const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 25000);
-      const cleanup = () => { clearInterval(ping); sseSessions.delete(sessionId); sseSessionTokens.delete(sessionId); };
-      req.on('close', cleanup);
-      res.on('close', cleanup);
-      res.on('error', cleanup);
+      openSseStream(sessionId, t => `/messages${TOKEN ? `?token=${t}&sessionId=${sessionId}` : `?sessionId=${sessionId}`}`, 25000, ': ping\n\n', false);
       return;
     }
     if (req.method === 'POST' && url.pathname === '/messages') {
@@ -1795,6 +1796,6 @@ server.on('error', (err) => {
 });
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`Easy MCP server on http://127.0.0.1:${PORT} — project: ${projectRoot}`);
-  try { startTunnel(); } catch (err) { tunnelError = err.message; }
+  startTunnel().catch(err => { tunnelError = err.message; });
   if (SKIP_JAIL) console.log('WARNING: --dangerously-skip-jail is ON. The AI can access the whole machine.');
 });
