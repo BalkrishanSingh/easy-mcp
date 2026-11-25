@@ -1,7 +1,7 @@
 {
   "name": "easy-mcp",
-  "version": "2.3.2",
-  "description": "Connect a local project folder to web AI clients over MCP, with a clean local web dashboard. Zero dependencies.",
+  "version": "2.3.3",
+  "description": "Connect a local project folder to web AI clients over MCP via Tailscale Funnel, with a clean local web dashboard. Zero dependencies.",
   "main": "easy-mcp.js",
   "bin": {
     "easy-mcp": "easy-mcp.js"

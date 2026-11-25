@@ -2,12 +2,12 @@
 /*
  * Easy MCP — launcher
  *
- * Starts the MCP server, opens a tunnel (Cloudflare or Tailscale Funnel),
+ * Starts the MCP server, exposes it via Tailscale Funnel,
  * and opens the local web dashboard in your browser.
  *
  * Usage:
- *   node easy-mcp.js [project-folder] [--port 9494] [--funnel] [--cloudflare] [--no-tunnel] [--no-open]
- *                    [--read-only] [--enable-shell] [--token <token>] [--rotate-token]
+ *   node easy-mcp.js [project-folder] [--port 9494] [--no-open]
+ *                    [--read-only] [--disable-shell] [--token <token>] [--rotate-token]
  *                    [--dangerously-skip-jail]  (no folder jail: whole machine)
  */
 'use strict';
@@ -45,8 +45,6 @@ function loadToken() {
   return fresh;
 }
 const TOKEN = loadToken();
-const NO_TUNNEL = args.includes('--no-tunnel');
-const TUNNEL_MODE = NO_TUNNEL ? 'none' : args.includes('--funnel') ? 'funnel' : args.includes('--cloudflare') ? 'cloudflare' : '';
 const NO_OPEN = args.includes('--no-open');
 const projectArg = args.find(a => !a.startsWith('--') && a !== argValue('--port', '') && a !== argValue('--token', ''));
 const SKIP_JAIL = args.includes('--dangerously-skip-jail');
@@ -84,7 +82,6 @@ function killOldInstances() {
       const escapedServer = serverPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       spawnSync('pkill', ['-f', escapedServer]);
       if (escapedServer !== 'easy-mcp.*server\\.js') spawnSync('pkill', ['-f', 'easy-mcp.*server\\.js']);
-      spawnSync('pkill', ['-f', 'cloudflared.*\\.easy-mcp']);
       // Also check if an easy-mcp node process is still holding our target port (macOS + Linux).
       const pids = new Set();
       const lsofOut = spawnSync('lsof', [`-tiTCP:${PORT}`, '-sTCP:LISTEN'], { encoding: 'utf8' }).stdout || '';
@@ -125,7 +122,7 @@ async function main() {
   if (args.includes('--disable-shell')) serverArgs.push('--disable-shell');
   if (SKIP_JAIL) serverArgs.push('--dangerously-skip-jail');
   const server = spawn(process.execPath, serverArgs, {
-    env: { ...process.env, EASY_MCP_PORT: String(PORT), EASY_MCP_TOKEN: TOKEN, EASY_MCP_PROJECT: projectDir, EASY_MCP_VERSION: VERSION, ...(TUNNEL_MODE ? { EASY_MCP_TUNNEL: TUNNEL_MODE } : {}) },
+    env: { ...process.env, EASY_MCP_PORT: String(PORT), EASY_MCP_TOKEN: TOKEN, EASY_MCP_PROJECT: projectDir, EASY_MCP_VERSION: VERSION },
     stdio: ['ignore', 'pipe', 'pipe']
   });
   server.stdout.on('data', d => process.stdout.write(d));

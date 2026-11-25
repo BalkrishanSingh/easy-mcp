@@ -67,134 +67,36 @@ function safeEqual(a, b) {
   const bb = Buffer.from(String(b || ''));
   return ba.length === bb.length && ba.length > 0 && crypto.timingSafeEqual(ba, bb);
 }
-// Shell is OFF by default. Modern web models reason and search on their own
-// cloud VMs; Easy MCP only syncs files. Shell is an opt-in for local test
-// runs: --enable-shell at startup, or the dashboard toggle at runtime.
-// (--disable-shell is still accepted for compatibility; it is the default.)
-let DISABLE_SHELL = !args.includes('--enable-shell') && process.env.EASY_MCP_ENABLE_SHELL !== '1';
+// Shell is ON by default in this fork. Pass --disable-shell (or toggle it in
+// the dashboard) to block execute_command and start_job.
+let DISABLE_SHELL = !args.includes('--enable-shell') && (args.includes('--disable-shell') || process.env.EASY_MCP_DISABLE_SHELL === '1');
 let READ_ONLY = args.includes('--read-only') || process.env.EASY_MCP_READ_ONLY === '1';
 let SKIP_JAIL = args.includes('--dangerously-skip-jail') || process.env.EASY_MCP_SKIP_JAIL === '1';
 let projectRoot = path.resolve(process.env.EASY_MCP_PROJECT || args.find(a => !a.startsWith('--')) || process.cwd());
 let publicUrl = (process.env.EASY_MCP_PUBLIC_URL || '').replace(/\/+$/, '');
 
 // ---------------------------------------------------------------------------
-// Tunnel manager — Cloudflare quick tunnel (default) or Tailscale Funnel
-// (persistent link). Mode persists in ~/.easy-mcp/config.json.
+// Tunnel manager — Tailscale Funnel (persistent link)
 // ---------------------------------------------------------------------------
 const easyMcpHome = path.join(os.homedir(), '.easy-mcp');
-const configFile = path.join(easyMcpHome, 'config.json');
-function loadConfig() { try { return JSON.parse(fs.readFileSync(configFile, 'utf8')); } catch { return {}; } }
-function saveConfig(patch) {
-  try {
-    fs.mkdirSync(easyMcpHome, { recursive: true });
-    fs.writeFileSync(configFile, JSON.stringify({ ...loadConfig(), ...patch }, null, 2) + '\n');
-  } catch {}
-}
-let tunnelMode = process.env.EASY_MCP_TUNNEL || loadConfig().tunnel || 'cloudflare';
-if (!['cloudflare', 'funnel', 'none'].includes(tunnelMode)) tunnelMode = 'cloudflare';
-let tunnelProc = null;
 let tunnelError = '';
 
-function cloudflaredPath() {
-  return path.join(easyMcpHome, 'bin', process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared');
-}
-function ensureCloudflared() {
-  const bin = cloudflaredPath();
-  if (fs.existsSync(bin)) return Promise.resolve(bin);
-  const base = 'https://github.com/cloudflare/cloudflared/releases/latest/download/';
-  const name = process.platform === 'win32' ? 'cloudflared-windows-amd64.exe'
-    : process.platform === 'darwin' ? (process.arch === 'arm64' ? 'cloudflared-darwin-arm64.tgz' : 'cloudflared-darwin-amd64.tgz')
-    : (process.arch === 'arm64' ? 'cloudflared-linux-arm64' : 'cloudflared-linux-amd64');
-  fs.mkdirSync(path.dirname(bin), { recursive: true });
-  const tmp = bin + '.tmp';
-  return new Promise((resolve, reject) => {
-    const get = (url) => https.get(url, (res) => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) return get(res.headers.location);
-      if (res.statusCode !== 200) return reject(new Error('cloudflared download failed: HTTP ' + res.statusCode));
-      const out = fs.createWriteStream(tmp);
-      res.pipe(out);
-      out.on('finish', () => {
-        try {
-          if (name.endsWith('.tgz')) {
-            // macOS builds ship as a tarball containing the cloudflared binary.
-            const dir = path.dirname(bin);
-            const r = spawnSync('tar', ['-xzf', tmp, '-C', dir], { stdio: 'ignore' });
-            if (r.status !== 0) return reject(new Error('cloudflared extract failed'));
-            const extracted = path.join(dir, 'cloudflared');
-            if (extracted !== bin && fs.existsSync(extracted)) fs.renameSync(extracted, bin);
-            try { fs.unlinkSync(tmp); } catch {}
-          } else {
-            fs.renameSync(tmp, bin);
-          }
-          if (process.platform !== 'win32') fs.chmodSync(bin, 0o755);
-          resolve(bin);
-        } catch (e) { reject(e); }
-      });
-      out.on('error', reject);
-    }).on('error', reject);
-    get(base + name);
-  });
-}
-
-function stopTunnel() {
-  if (tunnelProc) {
-    tunnelProc._stopped = true;
-    try { tunnelProc.kill(); } catch {}
-    tunnelProc = null;
-  }
-  // Note: Funnel is left ON in tailscaled when switching away — turning it off
-  // requires the Tailscale owner's session, and it proxies the same port anyway.
-  publicUrl = '';
-}
-
-async function startTunnel(mode) {
+async function startTunnel() {
   tunnelError = '';
-  if (mode === 'none') { tunnelMode = 'none'; return; }
-  if (mode === 'funnel') {
+  let dnsHost = process.env.EASY_MCP_FUNNEL_HOST || '';
+  if (!dnsHost) {
     try { spawnSync('tailscale', ['funnel', '--bg', String(PORT)], { stdio: 'ignore', timeout: 20000 }); } catch {}
-    let dns = '';
     try {
       const st = spawnSync('tailscale', ['status', '--json'], { encoding: 'utf8', timeout: 15000 });
-      dns = JSON.parse(st.stdout || '{}').Self?.DNSName?.replace(/\.$/, '') || '';
+      dnsHost = JSON.parse(st.stdout || '{}').Self?.DNSName?.replace(/\.$/, '') || '';
     } catch {}
-    dns = dns || process.env.EASY_MCP_FUNNEL_HOST || '';
-    if (!dns) {
-      tunnelError = 'Tailscale not found or not signed in. Install: https://tailscale.com/download';
-      tunnelMode = 'funnel';
-      return;
-    }
-    tunnelMode = 'funnel';
-    publicUrl = 'https://' + dns;
-    console.log(`MCP link:  ${publicUrl}/mcp/${TOKEN}`);
+  }
+  if (!dnsHost) {
+    tunnelError = 'Tailscale not found or not signed in. Install: https://tailscale.com/download';
     return;
   }
-  // cloudflare
-  tunnelMode = 'cloudflare';
-  const bin = await ensureCloudflared();
-  const proc = spawn(bin, ['tunnel', '--url', `http://127.0.0.1:${PORT}`], { stdio: ['ignore', 'pipe', 'pipe'] });
-  tunnelProc = proc;
-  const onData = (d) => {
-    const m = String(d).match(/https:\/\/(?!api\.)[a-z0-9-]+\.trycloudflare\.com/);
-    if (m && !publicUrl) {
-      publicUrl = m[0];
-      console.log(`MCP link:  ${publicUrl}/mcp/${TOKEN}`);
-    }
-  };
-  proc.stdout.on('data', onData);
-  proc.stderr.on('data', onData);
-  proc.on('exit', () => {
-    if (tunnelProc === proc) tunnelProc = null;
-    if (!proc._stopped && tunnelMode === 'cloudflare' && !publicUrl) {
-      tunnelError = 'Cloudflare tunnel failed to start (no internet route?)';
-    }
-  });
-}
-
-async function setTunnel(mode) {
-  if (!['cloudflare', 'funnel', 'none'].includes(mode)) throw new Error('Unknown tunnel mode: ' + mode);
-  stopTunnel();
-  saveConfig({ tunnel: mode });
-  await startTunnel(mode);
+  publicUrl = 'https://' + dnsHost;
+  console.log(`MCP link:  ${publicUrl}/mcp/${TOKEN}`);
 }
 const startedAt = Date.now();
 const recentFile = path.join(require('os').homedir(), '.easy-mcp', 'recent-projects.json');
@@ -524,7 +426,7 @@ const TOOLS = [
   },
   {
     name: 'execute_command',
-    description: 'Run a shell command inside the project folder (cmd on Windows, sh elsewhere). Returns exit code and output. Shell is OFF by default — if this errors, ask the user to enable Shell in the Easy MCP dashboard.',
+    description: 'Run a shell command inside the project folder (cmd on Windows, sh elsewhere). Returns exit code and output.',
     inputSchema: { type: 'object', properties: { command: { type: 'string' }, timeout_ms: { type: 'number' } }, required: ['command'] },
     shell: true,
     run: async ({ command, timeout_ms }) => {
@@ -644,7 +546,7 @@ async function callTool(name, toolArgs) {
   if (!tool) throw new Error(`Unknown tool: ${name}`);
   if (name === 'set_project' && !SKIP_JAIL) throw new Error('set_project is disabled while the folder jail is on; switch projects in the Easy MCP dashboard');
   if (READ_ONLY && tool.write) throw new Error('Server is read-only');
-  if (DISABLE_SHELL && tool.shell) throw new Error('Shell is off (the default). If you need to run tests or a build, ask the user to turn on Shell in the Easy MCP dashboard.');
+  if (DISABLE_SHELL && tool.shell) throw new Error('Shell is currently disabled; re-enable it in the Easy MCP dashboard if needed.');
   const t0 = Date.now();
   try {
     const result = await tool.run(toolArgs || {});
@@ -875,7 +777,6 @@ function dashboardData() {
     totalErrors,
     jobs: [...jobs.values()].map(j => ({ id: j.id, command: j.command, status: j.status, startedAt: j.startedAt })),
     publicUrl: publicUrl || null,
-    tunnelMode,
     tunnelError: tunnelError || null,
     mcpUrl: publicUrl ? `${publicUrl}/mcp${TOKEN ? '/' + TOKEN : ''}` : null,
     dashboardUrl: `http://127.0.0.1:${PORT}/`,
@@ -1055,29 +956,6 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     gap: 10px;
     margin-top: 12px;
     flex-wrap: wrap;
-  }
-  .tunnel-seg {
-    display: inline-flex;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    overflow: hidden;
-    background: var(--input-bg);
-  }
-  .tun-btn {
-    padding: 7px 13px;
-    font-family: var(--sans);
-    font-size: 12px;
-    font-weight: 500;
-    border: none;
-    cursor: pointer;
-    background: transparent;
-    color: var(--muted);
-  }
-  .tun-btn:hover { color: var(--text); }
-  .tun-btn.active {
-    background: linear-gradient(135deg, #f59e0b, #d9480f);
-    color: #fff;
-    font-weight: 600;
   }
 
   .quick-links {
@@ -1268,12 +1146,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
       <div class="tunnel-bar">
         <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-          <span style="font-size:12px; color:var(--muted);">Tunnel:</span>
-          <div class="tunnel-seg">
-            <button id="tunCloudflare" class="tun-btn" onclick="setTunnel('cloudflare')">Cloudflare</button>
-            <button id="tunFunnel" class="tun-btn" onclick="setTunnel('funnel')">Tailscale Funnel</button>
-            <button id="tunNone" class="tun-btn" onclick="setTunnel('none')">Local only</button>
-          </div>
+          <span style="font-size:12px; color:var(--muted);">Tailscale Funnel</span>
           <span id="tunError" style="font-size:12px; color:var(--err);"></span>
         </div>
 
@@ -1336,7 +1209,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         <div class="toggle-item">
           <div class="toggle-meta">
             <div class="t-title">Disable Shell Execution</div>
-            <div class="t-desc">Shell is OFF by default. Toggle off to allow tests or builds on this machine.</div>
+            <div class="t-desc">Shell is ON by default. Toggle on to block command execution and background jobs.</div>
           </div>
           <label class="switch">
             <input type="checkbox" id="togDisableShell" onchange="saveSetting('disableShell', this.checked)">
@@ -1432,16 +1305,6 @@ async function revokeOAuth(){
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Easy-Mcp-Admin': ADMIN },
     body: '{}'
-  });
-  tick();
-}
-
-async function setTunnel(mode){
-  document.getElementById('mcpUrl').value = '(switching tunnel...)';
-  await fetch('/api/set-tunnel', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Easy-Mcp-Admin': ADMIN },
-    body: JSON.stringify({ mode })
   });
   tick();
 }
@@ -1556,10 +1419,7 @@ async function tick(){
     document.getElementById('oauthMeta').textContent = 'OAuth clients: ' + (d.oauthClientsCount || 0);
     document.getElementById('revokeOAuthBtn').style.display = (d.oauthClientsCount || d.oauthTokensCount) ? 'inline-flex' : 'none';
 
-    document.getElementById('mcpUrl').value = d.mcpUrl || (d.tunnelMode === 'none' ? 'http://127.0.0.1:' + location.port + '/mcp' : '(tunnel starting...)');
-    document.getElementById('tunCloudflare').classList.toggle('active', d.tunnelMode === 'cloudflare');
-    document.getElementById('tunFunnel').classList.toggle('active', d.tunnelMode === 'funnel');
-    document.getElementById('tunNone').classList.toggle('active', d.tunnelMode === 'none');
+    document.getElementById('mcpUrl').value = d.mcpUrl || '(waiting for Tailscale Funnel...)';
 
     const te = document.getElementById('tunError');
     if (te) te.textContent = d.tunnelError || '';
@@ -1979,15 +1839,6 @@ const server = http.createServer(async (req, res) => {
       }
       return sendJson(res, 200, { success: false, status: result.status, error: result.error || null });
     }
-    if (req.method === 'POST' && url.pathname === '/api/set-tunnel') {
-      const { mode } = parseJsonBody(await readBody(req));
-      try {
-        await setTunnel(mode);
-        return sendJson(res, 200, { success: !tunnelError, tunnelMode, publicUrl: publicUrl || null, error: tunnelError || null });
-      } catch (err) {
-        return sendJson(res, 200, { success: false, tunnelMode, error: err.message });
-      }
-    }
     if (req.method === 'POST' && url.pathname === '/api/set-public-url') {
       const { url: u } = parseJsonBody(await readBody(req));
       const clean = String(u || '').trim().replace(/\/+$/, '');
@@ -2127,6 +1978,6 @@ server.on('error', (err) => {
 });
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`Easy MCP server on http://127.0.0.1:${PORT} — project: ${projectRoot}`);
-  startTunnel(tunnelMode).catch(err => { tunnelError = err.message; });
+  startTunnel().catch(err => { tunnelError = err.message; });
   if (SKIP_JAIL) console.log('WARNING: --dangerously-skip-jail is ON. The AI can access the whole machine.');
 });
