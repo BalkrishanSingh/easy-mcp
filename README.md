@@ -52,6 +52,15 @@ node easy-mcp.js [folder] [--port 9494] [--no-open] [--read-only]
 
 `read_file`, `read_files`, `write_file`, `write_files`, `edit_file`, `list_directory`, `search_files`, `get_file_info`, `execute_command`, `start_job`, `job_status`, `stop_job`, `list_jobs`, `git_status`, `git_diff`, `fetch_url`, `get_current_project`, `set_project`.
 
+## Security model
+
+- Every MCP request requires authentication (`Authorization: Bearer <token>`, `x-easy-mcp-token`, `/mcp/<token>`, `?token=<token>`, or an OAuth access token authorized with the master token).
+- Dashboard control plane (`/`, `/api/*`) is restricted to loopback requests without proxy/tunnel headers and protected by a per-process `ADMIN_SECRET`.
+- The server binds `127.0.0.1` only; remote traffic goes through Tailscale Funnel.
+- File operations are jailed to the project folder (traversal and symlink escapes rejected via `realpath`).
+- Shell execution is enabled by default in this fork; pass `--disable-shell` or toggle **Disable Shell Execution** in the dashboard to block shell commands and `.git`/`.gitmodules` writes.
+- `fetch_url` only fetches public `https://` addresses, fails closed on DNS failures, blocks private/loopback/CGNAT IPs, and pins the resolved IP.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

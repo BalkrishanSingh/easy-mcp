@@ -13,7 +13,7 @@
  *   GET  /               dashboard page
  *   GET  /api/dashboard  dashboard JSON
  *   POST /api/set-project { path }
- *   POST /api/set-public-url { url }   (called by the launcher)
+ *   POST /api/revoke-oauth
  *   POST /api/stop-job   { id }
  *
  * Auth: Authorization: Bearer <token>, x-easy-mcp-token header, or ?token=.
@@ -69,7 +69,7 @@ function safeEqual(a, b) {
 }
 // Shell is ON by default in this fork. Pass --disable-shell (or toggle it in
 // the dashboard) to block execute_command and start_job.
-let DISABLE_SHELL = !args.includes('--enable-shell') && (args.includes('--disable-shell') || process.env.EASY_MCP_DISABLE_SHELL === '1');
+let DISABLE_SHELL = args.includes('--disable-shell') || process.env.EASY_MCP_DISABLE_SHELL === '1';
 let READ_ONLY = args.includes('--read-only') || process.env.EASY_MCP_READ_ONLY === '1';
 let SKIP_JAIL = args.includes('--dangerously-skip-jail') || process.env.EASY_MCP_SKIP_JAIL === '1';
 let projectRoot = path.resolve(process.env.EASY_MCP_PROJECT || args.find(a => !a.startsWith('--')) || process.cwd());
@@ -81,16 +81,20 @@ let publicUrl = (process.env.EASY_MCP_PUBLIC_URL || '').replace(/\/+$/, '');
 const easyMcpHome = path.join(os.homedir(), '.easy-mcp');
 let tunnelError = '';
 
-async function startTunnel() {
+function startTunnel() {
   tunnelError = '';
-  let dnsHost = process.env.EASY_MCP_FUNNEL_HOST || '';
-  if (!dnsHost) {
-    try { spawnSync('tailscale', ['funnel', '--bg', String(PORT)], { stdio: 'ignore', timeout: 20000 }); } catch {}
-    try {
-      const st = spawnSync('tailscale', ['status', '--json'], { encoding: 'utf8', timeout: 15000 });
-      dnsHost = JSON.parse(st.stdout || '{}').Self?.DNSName?.replace(/\.$/, '') || '';
-    } catch {}
+  const funnel = spawnSync('tailscale', ['funnel', '--bg', String(PORT)], { encoding: 'utf8', timeout: 20000 });
+  if (funnel.error || funnel.status !== 0) {
+    const detail = (funnel.stderr || funnel.stdout || funnel.error?.message || '').trim();
+    tunnelError = detail || 'Tailscale Funnel failed to start. Check that Tailscale is running and Funnel is enabled.';
+    return;
   }
+  let dnsHost = '';
+  try {
+    const st = spawnSync('tailscale', ['status', '--json'], { encoding: 'utf8', timeout: 15000 });
+    dnsHost = JSON.parse(st.stdout || '{}').Self?.DNSName?.replace(/\.$/, '') || '';
+  } catch {}
+  dnsHost = dnsHost || process.env.EASY_MCP_FUNNEL_HOST || '';
   if (!dnsHost) {
     tunnelError = 'Tailscale not found or not signed in. Install: https://tailscale.com/download';
     return;
@@ -726,9 +730,9 @@ function authorized(req, url) {
   const rec = oauthTokens.get(sha256hex(given));
   return !!(rec && rec.type === 'access' && (!rec.exp || rec.exp > Date.now()));
 }
-// Dashboard control plane: loopback Host + no tunnel/proxy headers. (Both
-// cloudflared and Tailscale Funnel proxy from 127.0.0.1, so the socket IP
-// alone cannot tell local from remote — Host + proxy headers can.)
+// Dashboard control plane: loopback Host + no tunnel/proxy headers. (Tailscale
+// Funnel proxies from 127.0.0.1, so the socket IP alone cannot tell local from
+// remote — Host + proxy headers can.)
 function isLoopbackHost(host) {
   const h = String(host || '').toLowerCase();
   return h === `127.0.0.1:${PORT}` || h === `localhost:${PORT}` || h === `[::1]:${PORT}` || h === '127.0.0.1' || h === 'localhost' || h === '[::1]';
@@ -1839,13 +1843,6 @@ const server = http.createServer(async (req, res) => {
       }
       return sendJson(res, 200, { success: false, status: result.status, error: result.error || null });
     }
-    if (req.method === 'POST' && url.pathname === '/api/set-public-url') {
-      const { url: u } = parseJsonBody(await readBody(req));
-      const clean = String(u || '').trim().replace(/\/+$/, '');
-      if (!/^https:\/\//.test(clean)) return sendJson(res, 400, { success: false, error: 'url must be https://...' });
-      publicUrl = clean;
-      return sendJson(res, 200, { success: true, publicUrl });
-    }
     if (req.method === 'POST' && url.pathname === '/api/revoke-oauth') {
       oauthClients.clear();
       oauthTokens.clear();
@@ -1978,6 +1975,6 @@ server.on('error', (err) => {
 });
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`Easy MCP server on http://127.0.0.1:${PORT} — project: ${projectRoot}`);
-  startTunnel().catch(err => { tunnelError = err.message; });
+  try { startTunnel(); } catch (err) { tunnelError = err.message; }
   if (SKIP_JAIL) console.log('WARNING: --dangerously-skip-jail is ON. The AI can access the whole machine.');
 });

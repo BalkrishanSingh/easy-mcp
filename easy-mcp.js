@@ -73,7 +73,7 @@ function killOldInstances() {
   try {
     if (process.platform === 'win32') {
       const ps = [
-        "Get-CimInstance Win32_Process | Where-Object { ($_.Name -eq 'node.exe' -and $_.CommandLine -like '*easy-mcp*server.js*') -or ($_.Name -eq 'cloudflared.exe' -and $_.CommandLine -like '*.easy-mcp*') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
+        "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'node.exe' -and $_.CommandLine -like '*easy-mcp*server.js*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
         `Get-NetTCPConnection -LocalPort ${PORT} -State Listen -ErrorAction SilentlyContinue | ForEach-Object { $p = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue; if ($p -and $p.ProcessName -eq 'node') { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } }`,
       ].join('; ');
       spawnSync('powershell.exe', ['-NoProfile', '-Command', ps], { windowsHide: true });
@@ -118,7 +118,6 @@ async function main() {
 
   const serverArgs = [path.join(__dirname, 'server.js')];
   if (args.includes('--read-only')) serverArgs.push('--read-only');
-  if (args.includes('--enable-shell')) serverArgs.push('--enable-shell');
   if (args.includes('--disable-shell')) serverArgs.push('--disable-shell');
   if (SKIP_JAIL) serverArgs.push('--dangerously-skip-jail');
   const server = spawn(process.execPath, serverArgs, {
