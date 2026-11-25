@@ -13,7 +13,6 @@
  *   GET  /               dashboard page
  *   GET  /api/dashboard  dashboard JSON
  *   POST /api/set-project { path }
- *   POST /api/revoke-oauth
  *   POST /api/stop-job   { id }
  *
  * Auth: Authorization: Bearer <token>, x-easy-mcp-token header, or ?token=.
@@ -772,9 +771,6 @@ function dashboardData() {
     toolsCount: TOOLS.length,
     toolNames: TOOLS.map(t => t.name),
     activeSessions: sseSessions.size + mcpSessions.size,
-    oauthClientsCount: oauthClients.size,
-    oauthTokensCount: [...oauthTokens.values()].filter(t => t.type === 'refresh' || !t.exp || t.exp > Date.now()).length,
-    token: TOKEN,
     uptimeSec: Math.floor((Date.now() - startedAt) / 1000),
     startedAt: new Date(startedAt).toISOString(),
     totalCalls,
@@ -981,27 +977,6 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   }
   .quick-link:hover { border-color: var(--gold); }
 
-  .token-bar {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-top: 12px;
-    padding-top: 12px;
-    border-top: 1px solid var(--border);
-    flex-wrap: wrap;
-    font-size: 12px;
-    color: var(--muted);
-  }
-  .token-code {
-    font-family: var(--mono);
-    font-size: 11.5px;
-    background: var(--input-bg);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 4px 8px;
-    color: var(--text);
-  }
-
   .recents-label {
     font-size: 10.5px;
     font-weight: 700;
@@ -1161,15 +1136,6 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
           <a class="quick-link" href="https://gemini.google.com/customize/connectors" target="_blank" rel="noopener">Gemini</a>
         </div>
       </div>
-
-      <div class="token-bar">
-        <span>Access token (for OAuth / Bearer):</span>
-        <code class="token-code" id="tokenPreview">••••••••••••••••</code>
-        <button class="btn" style="padding:4px 10px;font-size:11.5px;" onclick="toggleToken(this)">Show</button>
-        <button class="btn" style="padding:4px 10px;font-size:11.5px;" onclick="copyToken(this)">Copy Token</button>
-        <span id="oauthMeta" style="margin-left:auto;">OAuth clients: 0</span>
-        <button class="btn" id="revokeOAuthBtn" style="padding:4px 10px;font-size:11.5px;display:none;" onclick="revokeOAuth()">Revoke OAuth</button>
-      </div>
     </div>
 
     <div class="card">
@@ -1273,44 +1239,17 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
 <script>
 const ADMIN = '__EASY_MCP_ADMIN__';
-let currentToken = '';
-let tokenVisible = false;
 
 function esc(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-
-function copyText(text, btn){
-  navigator.clipboard.writeText(text).then(() => {
-    const orig = btn.textContent;
-    btn.textContent = 'Copied!';
-    setTimeout(() => { btn.textContent = orig; }, 1400);
-  });
-}
 
 function copyEl(id, btn){
   const el = document.getElementById(id);
   el.select();
-  copyText(el.value, btn);
-}
-
-function toggleToken(btn){
-  tokenVisible = !tokenVisible;
-  btn.textContent = tokenVisible ? 'Hide' : 'Show';
-  document.getElementById('tokenPreview').textContent = tokenVisible ? (currentToken || '—') : '••••••••••••••••';
-}
-
-function copyToken(btn){
-  if (!currentToken) return;
-  copyText(currentToken, btn);
-}
-
-async function revokeOAuth(){
-  if (!confirm('Revoke all saved OAuth clients and access tokens? Connected web clients using OAuth will need to re-authorize.')) return;
-  await fetch('/api/revoke-oauth', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Easy-Mcp-Admin': ADMIN },
-    body: '{}'
+  navigator.clipboard.writeText(el.value).then(() => {
+    const orig = btn.textContent;
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = orig; }, 1400);
   });
-  tick();
 }
 
 async function setProject(pathOverride){
@@ -1418,11 +1357,6 @@ async function tick(){
     document.getElementById('togDisableShell').checked = d.disableShell;
     document.getElementById('togSkipJail').checked = d.skipJail;
 
-    currentToken = d.token || '';
-    if (tokenVisible) document.getElementById('tokenPreview').textContent = currentToken || '—';
-    document.getElementById('oauthMeta').textContent = 'OAuth clients: ' + (d.oauthClientsCount || 0);
-    document.getElementById('revokeOAuthBtn').style.display = (d.oauthClientsCount || d.oauthTokensCount) ? 'inline-flex' : 'none';
-
     document.getElementById('mcpUrl').value = d.mcpUrl || '(waiting for Tailscale Funnel...)';
 
     const te = document.getElementById('tunError');
@@ -1480,81 +1414,6 @@ const oauthTokensFile = path.join(easyMcpHome, 'oauth-tokens.json');
 function loadOAuthStore(file) { try { return new Map(Object.entries(JSON.parse(fs.readFileSync(file, 'utf8')))); } catch { return new Map(); } }
 const oauthClients = loadOAuthStore(oauthClientsFile); // client_id -> { secretHash, redirect_uris, authMethod, createdAt }
 const oauthTokens = loadOAuthStore(oauthTokensFile);   // sha256(token) -> { type, clientId, exp, createdAt }
-function escHtml(s) {
-  return String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
-
-function renderAuthorizePage({ clientId, redirectUri, state, challenge, method, responseType, errorMsg = '' }) {
-  let targetOrigin = redirectUri;
-  try { targetOrigin = new URL(redirectUri).origin; } catch {}
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Authorize Easy MCP Access</title>
-<style>
-  :root { color-scheme: dark light; --bg:#0d0c0a; --card:#151311; --border:#29241f; --text:#f5f0eb; --muted:#96897b; --err:#ef4444; }
-  @media (prefers-color-scheme: light) { :root { --bg:#faf7f2; --card:#fff; --border:#e8e0d5; --text:#1d1916; --muted:#706356; } }
-  * { box-sizing:border-box; margin:0; padding:0; }
-  body { font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; background:var(--bg); color:var(--text); min-height:100vh; display:flex; align-items:center; justify-content:center; padding:20px; }
-  .card { width:100%; max-width:440px; background:var(--card); border:1px solid var(--border); border-radius:12px; padding:24px; }
-  h1 { font-size:18px; margin-bottom:8px; }
-  p { font-size:13px; color:var(--muted); line-height:1.5; margin-bottom:14px; }
-  .meta { font-family: ui-monospace, monospace; font-size:12px; background:rgba(127,127,127,.08); border:1px solid var(--border); border-radius:8px; padding:10px 12px; margin-bottom:14px; word-break:break-all; }
-  label { display:block; font-size:12px; font-weight:600; margin-bottom:6px; }
-  input[type=password] { width:100%; padding:10px 12px; border-radius:8px; border:1px solid var(--border); background:transparent; color:var(--text); font-family:ui-monospace, monospace; font-size:13px; margin-bottom:14px; }
-  .err { color:var(--err); font-size:12.5px; margin-bottom:12px; }
-  .row { display:flex; gap:8px; }
-  button { flex:1; padding:10px 14px; border-radius:8px; border:1px solid var(--border); cursor:pointer; font-weight:600; font-size:13px; background:transparent; color:var(--text); }
-  button.primary { background:linear-gradient(135deg,#f59e0b,#d9480f); border-color:#d9480f; color:#fff; }
-</style>
-</head>
-<body>
-<div class="card">
-  <h1>Authorize Easy MCP Client</h1>
-  <p>An application is requesting OAuth access to your Easy MCP server. Enter your Easy MCP access token (shown in your local dashboard or <code>~/.easy-mcp/token</code>) to approve.</p>
-  <div class="meta">
-    <div><strong>Client:</strong> ${escHtml(clientId)}</div>
-    <div><strong>Redirect:</strong> ${escHtml(targetOrigin)}</div>
-  </div>
-  ${errorMsg ? `<div class="err">${escHtml(errorMsg)}</div>` : ''}
-  <form method="POST" action="/oauth/authorize">
-    <input type="hidden" name="client_id" value="${escHtml(clientId)}">
-    <input type="hidden" name="redirect_uri" value="${escHtml(redirectUri)}">
-    <input type="hidden" name="state" value="${escHtml(state)}">
-    <input type="hidden" name="code_challenge" value="${escHtml(challenge)}">
-    <input type="hidden" name="code_challenge_method" value="${escHtml(method)}">
-    <input type="hidden" name="response_type" value="${escHtml(responseType)}">
-    <label for="tok">Easy MCP Access Token</label>
-    <input id="tok" type="password" name="token" autocomplete="off" required placeholder="Paste access token">
-    <div class="row">
-      <button type="submit" name="action" value="deny" formnovalidate>Deny</button>
-      <button type="submit" name="action" value="approve" class="primary">Authorize</button>
-    </div>
-  </form>
-</div>
-</body>
-</html>`;
-}
-
-function validateAuthorizeParams(params) {
-  const redirectUri = params.get('redirect_uri');
-  const state = params.get('state') || '';
-  const clientId = params.get('client_id') || '';
-  const responseType = params.get('response_type') || '';
-  const challenge = params.get('code_challenge') || '';
-  const method = params.get('code_challenge_method') || 'S256';
-  const client = oauthClients.get(clientId);
-  if (!redirectUri) return { noRedirect: true };
-  if (!client) return { error: 'invalid_client', error_description: 'Unknown client_id — register first' };
-  if (responseType !== 'code') return { error: 'unsupported_response_type' };
-  if (!challenge && client.authMethod === 'none') return { error: 'invalid_request', error_description: 'code_challenge (PKCE) is required for public clients' };
-  const uriOk = client.redirect_uris.length ? client.redirect_uris.includes(redirectUri) : validRedirectUri(redirectUri);
-  if (!uriOk) return { error: 'invalid_redirect_uri' };
-  return { ok: true, clientId, redirectUri, state, challenge, method, responseType };
-}
-
 function saveOAuth() {
   const now = Date.now();
   for (const [k, v] of oauthTokens) {
@@ -1701,50 +1560,36 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 201, out);
     }
 
-    const sendHtml = (code, html) => {
-      res.writeHead(code, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY' });
-      return res.end(html);
-    };
-    const sendOAuthError = (v) => sendJson(res, 400, { error: v.error, ...(v.error_description ? { error_description: v.error_description } : {}) });
-    const redirectWithParams = (baseUri, params) => {
-      const target = new URL(baseUri);
-      for (const [k, val] of Object.entries(params)) {
-        if (val !== undefined && val !== '') target.searchParams.set(k, val);
+    if (url.pathname === '/oauth/authorize') {
+      const redirectUri = url.searchParams.get('redirect_uri');
+      const state = url.searchParams.get('state') || '';
+      const clientId = url.searchParams.get('client_id') || '';
+      const client = oauthClients.get(clientId);
+      if (redirectUri) {
+        if (!client) return sendJson(res, 400, { error: 'invalid_client', error_description: 'Unknown client_id — register first' });
+        if (url.searchParams.get('response_type') !== 'code') return sendJson(res, 400, { error: 'unsupported_response_type' });
+        const challenge = url.searchParams.get('code_challenge') || '';
+        if (!challenge && client.authMethod === 'none') return sendJson(res, 400, { error: 'invalid_request', error_description: 'code_challenge (PKCE) is required for public clients' });
+        const uriOk = client.redirect_uris.length ? client.redirect_uris.includes(redirectUri) : validRedirectUri(redirectUri);
+        if (!uriOk) return sendJson(res, 400, { error: 'invalid_redirect_uri' });
+        const code = crypto.randomBytes(32).toString('hex');
+        oauthCodes.set(code, {
+          exp: Date.now() + 600000,
+          challenge,
+          method: url.searchParams.get('code_challenge_method') || 'S256',
+          clientId,
+          redirectUri
+        });
+        if (oauthCodes.size > 100) { for (const [k, v] of oauthCodes) { if (v.exp < Date.now()) oauthCodes.delete(k); } }
+        const target = new URL(redirectUri);
+        target.searchParams.set('code', code);
+        if (state) target.searchParams.set('state', state);
+        const issBase = publicUrl || `http://${req.headers.host || '127.0.0.1:' + PORT}`;
+        target.searchParams.set('iss', issBase);
+        res.writeHead(302, { Location: target.toString() });
+        return res.end();
       }
-      res.writeHead(302, { Location: target.toString() });
-      return res.end();
-    };
-
-    if (url.pathname === '/oauth/authorize' && req.method === 'GET') {
-      const v = validateAuthorizeParams(url.searchParams);
-      if (v.noRedirect) return sendJson(res, 200, { status: 'authorization_endpoint' });
-      if (v.error) return sendOAuthError(v);
-      return sendHtml(200, renderAuthorizePage(v));
-    }
-
-    if (url.pathname === '/oauth/authorize' && req.method === 'POST') {
-      const form = new URLSearchParams(await readBody(req, 65536));
-      const v = validateAuthorizeParams(form);
-      if (v.noRedirect) return sendJson(res, 400, { error: 'invalid_request', error_description: 'redirect_uri required' });
-      if (v.error) return sendOAuthError(v);
-      if (form.get('action') === 'deny') {
-        return redirectWithParams(v.redirectUri, { error: 'access_denied', state: v.state });
-      }
-      const submittedToken = (form.get('token') || '').trim();
-      if (!safeEqual(submittedToken, TOKEN)) {
-        return sendHtml(401, renderAuthorizePage({ ...v, errorMsg: 'Invalid access token.' }));
-      }
-      const code = crypto.randomBytes(32).toString('hex');
-      oauthCodes.set(code, {
-        exp: Date.now() + 600000,
-        challenge: v.challenge,
-        method: v.method,
-        clientId: v.clientId,
-        redirectUri: v.redirectUri
-      });
-      if (oauthCodes.size > 100) { for (const [k, info] of oauthCodes) { if (info.exp < Date.now()) oauthCodes.delete(k); } }
-      const issBase = publicUrl || `http://${req.headers.host || '127.0.0.1:' + PORT}`;
-      return redirectWithParams(v.redirectUri, { code, state: v.state, iss: issBase });
+      return sendJson(res, 200, { status: 'authorized' });
     }
 
     if (url.pathname === '/oauth/token' && req.method === 'POST') {
@@ -1843,13 +1688,6 @@ const server = http.createServer(async (req, res) => {
       }
       return sendJson(res, 200, { success: false, status: result.status, error: result.error || null });
     }
-    if (req.method === 'POST' && url.pathname === '/api/revoke-oauth') {
-      oauthClients.clear();
-      oauthTokens.clear();
-      oauthCodes.clear();
-      saveOAuth();
-      return sendJson(res, 200, { success: true });
-    }
     if (req.method === 'GET' && url.pathname === '/api/settings') {
       return sendJson(res, 200, { readOnly: READ_ONLY, disableShell: DISABLE_SHELL, skipJail: SKIP_JAIL });
     }
@@ -1931,6 +1769,7 @@ const server = http.createServer(async (req, res) => {
       const cleanup = () => { clearInterval(ping); sseSessions.delete(sseId); sseSessionTokens.delete(sseId); };
       req.on('close', cleanup);
       res.on('close', cleanup);
+      res.on('error', cleanup);
       return;
     }
     if (url.pathname === '/mcp' && req.method === 'DELETE') {
@@ -1940,15 +1779,19 @@ const server = http.createServer(async (req, res) => {
       return res.end();
     }
     if (req.method === 'GET' && url.pathname === '/sse') {
+      if (req.socket) { req.socket.setKeepAlive(true, 10000); req.socket.setNoDelay(true); }
       const sessionId = crypto.randomBytes(8).toString('hex');
-      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
       sseSessions.set(sessionId, res);
       const sseToken = crypto.randomBytes(16).toString('hex');
       sseSessionTokens.set(sessionId, sseToken);
       const q = TOKEN ? `?token=${sseToken}&sessionId=${sessionId}` : `?sessionId=${sessionId}`;
       res.write(`event: endpoint\ndata: /messages${q}\n\n`);
-      const ping = setInterval(() => res.write(': ping\n\n'), 25000);
-      req.on('close', () => { clearInterval(ping); sseSessions.delete(sessionId); sseSessionTokens.delete(sessionId); });
+      const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 25000);
+      const cleanup = () => { clearInterval(ping); sseSessions.delete(sessionId); sseSessionTokens.delete(sessionId); };
+      req.on('close', cleanup);
+      res.on('close', cleanup);
+      res.on('error', cleanup);
       return;
     }
     if (req.method === 'POST' && url.pathname === '/messages') {
@@ -1956,7 +1799,7 @@ const server = http.createServer(async (req, res) => {
       const sse = sseSessions.get(sessionId);
       const msg = parseJsonBody(await readBody(req));
       const out = await handleRpc(msg);
-      if (out && sse) sse.write(`event: message\ndata: ${JSON.stringify(out)}\n\n`);
+      if (out && sse) { try { sse.write(`event: message\ndata: ${JSON.stringify(out)}\n\n`); } catch {} }
       res.writeHead(202);
       return res.end();
     }
@@ -1965,6 +1808,9 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, err.statusCode || 500, { error: err.message });
   }
 });
+
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
 
 server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {

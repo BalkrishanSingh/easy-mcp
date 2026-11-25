@@ -9,7 +9,6 @@ A clean, hardened fork of `mrkaylabs/easy-mcp` tailored for **Tailscale Funnel**
 - **Tailscale Funnel only on `main`**: Removed `cloudflared` download/management and local-only tunnel switching; publishes directly via `tailscale funnel --bg <port>`.
 - **Shell enabled by default**: `execute_command` and `start_job` are enabled by default (toggle **Disable Shell Execution** in the dashboard or pass `--disable-shell` to turn off).
 - **No ads, popups, or outbound phone-homes**: Removed the floating `Share AI Slot` ad banner, intro modal, promo copy, Google Fonts CDN links, and startup GitHub release check.
-- **OAuth authorization gated by token**: `/oauth/authorize` requires submitting the local Easy MCP access token instead of auto-approving arbitrary OAuth clients on the public tunnel URL. Includes an OAuth session counter and one-click revoke button on the dashboard.
 - **Security & reliability fixes**:
   - Case-insensitive `.git` / `.gitmodules` write blocking while shell is disabled.
   - Fail-closed DNS validation and pinned IP resolution in `fetch_url` (blocks private/loopback/CGNAT IPs).
@@ -54,7 +53,7 @@ node easy-mcp.js [folder] [--port 9494] [--no-open] [--read-only]
 
 ## Security model
 
-- Every MCP request requires authentication (`Authorization: Bearer <token>`, `x-easy-mcp-token`, `/mcp/<token>`, `?token=<token>`, or an OAuth access token authorized with the master token).
+- Every MCP request requires authentication (`Authorization: Bearer <token>`, `x-easy-mcp-token`, `/mcp/<token>`, `?token=<token>`, or an OAuth access token).
 - Dashboard control plane (`/`, `/api/*`) is restricted to loopback requests without proxy/tunnel headers and protected by a per-process `ADMIN_SECRET`.
 - The server binds `127.0.0.1` only; remote traffic goes through Tailscale Funnel.
 - File operations are jailed to the project folder (traversal and symlink escapes rejected via `realpath`).
